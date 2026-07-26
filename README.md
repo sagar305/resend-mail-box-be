@@ -27,9 +27,12 @@ npm run dev             # http://localhost:4000
 | `MAILBOX_USER` | The one username that can sign in. |
 | `MAILBOX_PASSWORD` | That user's password. |
 | `SESSION_SECRET` | Signs the session JWT. Generate with `openssl rand -hex 32`. |
-| `PORT` | Defaults to `4000`. |
-| `CORS_ORIGIN` | Allowed browser origin. Defaults to `http://localhost:5173`. |
-| `DATABASE_FILE` | SQLite path, relative to the repo root. Defaults to `data/mailbox.db`. |
+| `PORT` | Defaults to `4000`. Railway injects this. |
+| `CORS_ORIGIN` | Allowed browser origins, comma separated. Entries may be exact (`https://app.vercel.app`), a wildcard host (`*.vercel.app`, which covers preview deploys), or `*`. Defaults to `http://localhost:5173`. Irrelevant when the frontend proxies `/api`. |
+| `DATABASE_FILE` | SQLite path. Relative paths resolve against the repo root; absolute paths are used as given. Defaults to `data/mailbox.db`. |
+| `COOKIE_SAMESITE` | `lax` (default) when the browser reaches the API on its own origin; `none` when the frontend calls this API cross-site. |
+| `COOKIE_SECURE` | Defaults to true when `NODE_ENV=production`. Forced true when `COOKIE_SAMESITE=none`. |
+| `TRUST_PROXY` | Trust `X-Forwarded-*`. Defaults to true in production. |
 
 ## What is stored locally, and why
 
@@ -104,6 +107,61 @@ domain. If the domain already handles real mail, put the record on a subdomain
 instead. Until that is configured, the inbox is simply empty — the app still
 runs and sending still works. See
 [Resend's receiving docs](https://resend.com/docs/dashboard/receiving/introduction).
+
+## Deploying to Railway
+
+`railway.json` sets the start command, and points Railway's healthcheck at
+`/api/health`. Node is pinned to 22 via `.nvmrc`.
+
+1. **New Project → Deploy from GitHub repo**, pick this repo and the branch.
+2. **Add a volume** (Service → Data → Add Volume) with mount path `/data`.
+   This is not optional if you want drafts to survive: Railway's container
+   filesystem is rebuilt on every deploy, so a database inside the app directory
+   is wiped each time. The server logs a warning at boot if it detects this.
+3. **Set the variables** under Service → Variables:
+
+   ```
+   RESEND_API_KEY=re_...
+   MAILBOX_ADDRESS=you@yourdomain.com
+   MAILBOX_USER=admin
+   MAILBOX_PASSWORD=<something long>
+   SESSION_SECRET=<openssl rand -hex 32>
+   DATABASE_FILE=/data/mailbox.db
+   NODE_ENV=production
+   ```
+
+   Leave `PORT` alone — Railway injects it.
+4. **Generate a domain** (Settings → Networking → Generate Domain) and note the
+   `*.up.railway.app` URL. The frontend needs it.
+5. Then pick one of the two ways to connect the frontend, below.
+
+### Connecting the frontend: pick one
+
+**A. Same-origin proxy — recommended.** The Vercel app rewrites `/api/*` to this
+service, so the browser only ever talks to the Vercel domain. The session cookie
+stays first-party, nothing extra is needed here:
+
+```
+COOKIE_SAMESITE=lax
+```
+
+**B. Direct cross-origin.** The browser calls Railway straight from the Vercel
+page. This makes the session a *third-party* cookie:
+
+```
+COOKIE_SAMESITE=none
+CORS_ORIGIN=https://your-app.vercel.app,*.vercel.app
+```
+
+Be aware that Safari blocks third-party cookies by default, and Chrome and
+Firefox both offer settings that do the same — under option B those users cannot
+stay signed in. That is why A is the default.
+
+### If the build fails on `better-sqlite3`
+
+It is a native module and normally installs from a prebuilt binary. If Railway's
+builder can't find one for its Node version, add `NIXPACKS_PKGS=python3 gcc`
+to the service variables so it can compile from source.
 
 ## Not included
 
