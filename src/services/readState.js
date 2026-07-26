@@ -1,32 +1,40 @@
-import { db } from '../db.js';
+import { getCollections } from '../db.js';
 
-const markReadStmt = db.prepare(
-  'INSERT INTO read_receipts (email_id, read_at) VALUES (?, ?) ON CONFLICT(email_id) DO NOTHING',
-);
-const markUnreadStmt = db.prepare('DELETE FROM read_receipts WHERE email_id = ?');
-const isReadStmt = db.prepare('SELECT 1 FROM read_receipts WHERE email_id = ?');
+/*
+ * Resend does not track whether an inbound message has been read, so it is
+ * tracked here. A document exists only for messages that have been read, and
+ * its `_id` is the Resend email id — that gives uniqueness for free and makes
+ * "mark read" a plain upsert.
+ */
 
-export function markRead(emailId) {
-  markReadStmt.run(emailId, new Date().toISOString());
+export async function markRead(emailId) {
+  const { readReceipts } = getCollections();
+  await readReceipts.updateOne(
+    { _id: emailId },
+    { $setOnInsert: { readAt: new Date().toISOString() } },
+    { upsert: true },
+  );
 }
 
-export function markUnread(emailId) {
-  markUnreadStmt.run(emailId);
+export async function markUnread(emailId) {
+  const { readReceipts } = getCollections();
+  await readReceipts.deleteOne({ _id: emailId });
 }
 
-export function isRead(emailId) {
-  return Boolean(isReadStmt.get(emailId));
+export async function isRead(emailId) {
+  const { readReceipts } = getCollections();
+  return Boolean(await readReceipts.findOne({ _id: emailId }));
 }
 
 /** Attach a `read` flag to a page of inbox messages in one query. */
-export function withReadState(messages) {
+export async function withReadState(messages) {
   if (!messages.length) return messages;
 
-  const placeholders = messages.map(() => '?').join(',');
-  const rows = db
-    .prepare(`SELECT email_id FROM read_receipts WHERE email_id IN (${placeholders})`)
-    .all(...messages.map((message) => message.id));
-  const readIds = new Set(rows.map((row) => row.email_id));
+  const { readReceipts } = getCollections();
+  const docs = await readReceipts
+    .find({ _id: { $in: messages.map((message) => message.id) } })
+    .toArray();
+  const readIds = new Set(docs.map((doc) => doc._id));
 
   return messages.map((message) => ({ ...message, read: readIds.has(message.id) }));
 }

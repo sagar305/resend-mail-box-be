@@ -1,10 +1,6 @@
-import path from 'node:path';
-import { fileURLToPath } from 'node:url';
 import dotenv from 'dotenv';
 
 dotenv.config();
-
-const rootDir = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 
 function required(name) {
   const value = process.env[name];
@@ -59,6 +55,9 @@ export const config = {
       cookieSameSite === 'none' ? true : parseBoolean(process.env.COOKIE_SECURE, isProduction),
   },
 
-  databaseFile: path.resolve(rootDir, process.env.DATABASE_FILE || 'data/mailbox.db'),
+  // Holds drafts and read/unread state — the two things Resend does not model.
+  mongoUri: required('MONGO_URI'),
+  mongoDbName: process.env.MONGO_DB || 'mailbox',
+
   isProduction,
 };

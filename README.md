@@ -8,7 +8,7 @@ Frontend lives in [`resend-mail-box`](https://github.com/sagar305/resend-mail-bo
 
 ## Stack
 
-Node 20+ · Express 5 · plain JavaScript (ESM) · SQLite (`better-sqlite3`) · `resend` SDK
+Node 20+ · Express 5 · plain JavaScript (ESM) · MongoDB · `resend` SDK
 
 ## Setup
 
@@ -17,6 +17,18 @@ npm install
 cp .env.example .env    # then fill it in
 npm run dev             # http://localhost:4000
 ```
+
+You need a MongoDB to point `MONGO_URI` at. Either a free
+[Atlas](https://www.mongodb.com/cloud/atlas) M0 cluster (same one you can use in
+production), or a local instance:
+
+```bash
+docker run -d -p 27017:27017 --name mailbox-mongo mongo:7
+# then MONGO_URI=mongodb://localhost:27017
+```
+
+The server connects before it starts listening, so a bad `MONGO_URI` fails the
+boot with a clear error instead of serving 500s.
 
 ### Environment variables
 
@@ -29,22 +41,25 @@ npm run dev             # http://localhost:4000
 | `SESSION_SECRET` | Signs the session JWT. Generate with `openssl rand -hex 32`. |
 | `PORT` | Defaults to `4000`. Railway injects this. |
 | `CORS_ORIGIN` | Allowed browser origins, comma separated. Entries may be exact (`https://app.vercel.app`), a wildcard host (`*.vercel.app`, which covers preview deploys), or `*`. Defaults to `http://localhost:5173`. Irrelevant when the frontend proxies `/api`. |
-| `DATABASE_FILE` | SQLite path. Relative paths resolve against the repo root; absolute paths are used as given. Defaults to `data/mailbox.db`. |
+| `MONGO_URI` | **Required.** Connection string, e.g. `mongodb+srv://…` from Atlas or `mongodb://localhost:27017`. |
+| `MONGO_DB` | Database name. Defaults to `mailbox`. |
 | `COOKIE_SAMESITE` | `lax` (default) when the browser reaches the API on its own origin; `none` when the frontend calls this API cross-site. |
 | `COOKIE_SECURE` | Defaults to true when `NODE_ENV=production`. Forced true when `COOKIE_SAMESITE=none`. |
 | `TRUST_PROXY` | Trust `X-Forwarded-*`. Defaults to true in production. |
 
-## What is stored locally, and why
+## What is stored in MongoDB, and why
 
 Resend is an email API, not a mail host, so two things it does not model are kept
-in SQLite:
+in Mongo:
 
-- **Drafts** — Resend has no draft concept at all.
-- **Read/unread state** — Resend does not track whether you have read an inbound
-  message.
+| Collection | Contents |
+| --- | --- |
+| `drafts` | One document per draft. `_id` is a UUID string, not an ObjectId, so the id the API returns is the id stored. Indexed on `updatedAt` descending, which is the order they are listed in. |
+| `readReceipts` | One document per message that has been **read**, with the Resend email id as `_id`. Absence means unread, so marking read is an upsert and marking unread is a delete. |
 
 Everything else (sent mail, received mail, bodies, attachment metadata) is read
-live from Resend and never mirrored.
+live from Resend and never mirrored. Both collections are created on first write
+— there is no migration step.
 
 ## Auth
 
@@ -113,11 +128,15 @@ runs and sending still works. See
 `railway.json` sets the start command, and points Railway's healthcheck at
 `/api/health`. Node is pinned to 22 via `.nvmrc`.
 
-1. **New Project → Deploy from GitHub repo**, pick this repo and the branch.
-2. **Add a volume** (Service → Data → Add Volume) with mount path `/data`.
-   This is not optional if you want drafts to survive: Railway's container
-   filesystem is rebuilt on every deploy, so a database inside the app directory
-   is wiped each time. The server logs a warning at boot if it detects this.
+Because state lives in MongoDB rather than on disk, there is **no volume to
+provision** — the service is stateless and survives redeploys on its own.
+
+1. **Create a MongoDB Atlas cluster** (the free M0 tier is ample for one
+   mailbox). Then, under Network Access, either allowlist Railway's egress IPs
+   or use `0.0.0.0/0` with a strong database password — Atlas rejects
+   connections from unlisted addresses, and this is the usual first thing to get
+   wrong. Copy the connection string from Database → Connect → Drivers.
+2. **New Project → Deploy from GitHub repo**, pick this repo and the branch.
 3. **Set the variables** under Service → Variables:
 
    ```
@@ -126,14 +145,19 @@ runs and sending still works. See
    MAILBOX_USER=admin
    MAILBOX_PASSWORD=<something long>
    SESSION_SECRET=<openssl rand -hex 32>
-   DATABASE_FILE=/data/mailbox.db
+   MONGO_URI=mongodb+srv://user:password@cluster0.xxxxx.mongodb.net/?retryWrites=true&w=majority
    NODE_ENV=production
    ```
 
-   Leave `PORT` alone — Railway injects it.
+   Leave `PORT` alone — Railway injects it. `MONGO_DB` is optional and defaults
+   to `mailbox`.
 4. **Generate a domain** (Settings → Networking → Generate Domain) and note the
    `*.up.railway.app` URL. The frontend needs it.
 5. Then pick one of the two ways to connect the frontend, below.
+
+Prefer to keep everything on Railway? Deploy their MongoDB template as a second
+service in the same project and use its private-network connection string as
+`MONGO_URI` — then there is no IP allowlist and Mongo is never publicly exposed.
 
 ### Connecting the frontend: pick one
 
@@ -157,11 +181,16 @@ Be aware that Safari blocks third-party cookies by default, and Chrome and
 Firefox both offer settings that do the same — under option B those users cannot
 stay signed in. That is why A is the default.
 
-### If the build fails on `better-sqlite3`
+### If the deploy fails on startup
 
-It is a native module and normally installs from a prebuilt binary. If Railway's
-builder can't find one for its Node version, add `NIXPACKS_PKGS=python3 gcc`
-to the service variables so it can compile from source.
+The boot sequence connects to Mongo before it listens, so a Mongo problem shows
+up as a failed healthcheck. Check the deploy logs:
+
+- `MongoServerSelectionError … timed out` — Atlas is refusing the connection.
+  Almost always the Network Access allowlist.
+- `MongoParseError` — the `MONGO_URI` is malformed. Watch for an unescaped `@`
+  or `/` in the password; those need percent-encoding.
+- `Missing required environment variable: X` — exactly what it says.
 
 ## Not included
 

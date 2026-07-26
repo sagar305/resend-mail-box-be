@@ -1,45 +1,45 @@
-import fs from 'node:fs';
-import path from 'node:path';
-import { fileURLToPath } from 'node:url';
-import Database from 'better-sqlite3';
+import { MongoClient } from 'mongodb';
 import { config } from './config.js';
 
-const projectRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
+let client = null;
+let database = null;
 
-// On a PaaS the container filesystem is wiped on every deploy, so a database
-// sitting inside the app directory silently loses drafts and read state. Loud
-// warning rather than a hard failure: it is a valid choice for a throwaway
-// instance, just never what you want by accident.
-if (config.isProduction && !path.relative(projectRoot, config.databaseFile).startsWith('..')) {
-  console.warn(
-    `[warn] ${config.databaseFile} is inside the app directory. On Railway this is ephemeral — ` +
-      'drafts and read/unread state will reset on each deploy. Attach a volume and point ' +
-      'DATABASE_FILE at it (e.g. /data/mailbox.db).',
-  );
+/**
+ * Point the app at a database instance. `connectDb` calls this after dialing
+ * MongoDB; tests call it directly with an in-memory stand-in.
+ */
+export function useDatabase(db) {
+  database = db;
 }
 
-fs.mkdirSync(path.dirname(config.databaseFile), { recursive: true });
+export function getCollections() {
+  if (!database) {
+    throw new Error('Database not connected. Call connectDb() before handling requests.');
+  }
+  return {
+    drafts: database.collection('drafts'),
+    readReceipts: database.collection('readReceipts'),
+  };
+}
 
-export const db = new Database(config.databaseFile);
+export async function connectDb() {
+  client = new MongoClient(config.mongoUri, {
+    // Fail fast on a bad URI or blocked IP rather than hanging the boot.
+    serverSelectionTimeoutMS: 10_000,
+  });
+  await client.connect();
+  useDatabase(client.db(config.mongoDbName));
 
-db.pragma('journal_mode = WAL');
+  // Drafts are always listed most-recently-edited first.
+  await getCollections().drafts.createIndex({ updatedAt: -1 });
 
-// Resend has no drafts concept and stores no read/unread state, so both live here.
-db.exec(`
-  CREATE TABLE IF NOT EXISTS drafts (
-    id          TEXT PRIMARY KEY,
-    to_addrs    TEXT NOT NULL DEFAULT '[]',
-    cc_addrs    TEXT NOT NULL DEFAULT '[]',
-    bcc_addrs   TEXT NOT NULL DEFAULT '[]',
-    subject     TEXT NOT NULL DEFAULT '',
-    html        TEXT NOT NULL DEFAULT '',
-    text        TEXT NOT NULL DEFAULT '',
-    created_at  TEXT NOT NULL,
-    updated_at  TEXT NOT NULL
-  );
+  return database;
+}
 
-  CREATE TABLE IF NOT EXISTS read_receipts (
-    email_id  TEXT PRIMARY KEY,
-    read_at   TEXT NOT NULL
-  );
-`);
+export async function closeDb() {
+  if (client) {
+    await client.close();
+    client = null;
+  }
+  database = null;
+}

@@ -9,21 +9,21 @@ const asyncRoute = (handler) => (req, res, next) => handler(req, res, next).catc
 
 mailRouter.get('/inbox', asyncRoute(async (req, res) => {
   const { messages, hasMore } = await listReceived(parsePagination(req.query));
-  res.json({ messages: withReadState(messages), hasMore });
+  res.json({ messages: await withReadState(messages), hasMore });
 }));
 
 mailRouter.get('/inbox/:id', asyncRoute(async (req, res) => {
   const message = await getReceived(req.params.id);
   // Opening a message marks it read, the same as any mail client.
-  markRead(message.id);
+  await markRead(message.id);
   res.json({ message: { ...message, read: true } });
 }));
 
 mailRouter.patch('/inbox/:id/read', asyncRoute(async (req, res) => {
   const read = req.body?.read !== false;
-  if (read) markRead(req.params.id);
-  else markUnread(req.params.id);
-  res.json({ id: req.params.id, read: isRead(req.params.id) });
+  if (read) await markRead(req.params.id);
+  else await markUnread(req.params.id);
+  res.json({ id: req.params.id, read: await isRead(req.params.id) });
 }));
 
 mailRouter.get('/sent', asyncRoute(async (req, res) => {
