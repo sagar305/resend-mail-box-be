@@ -1,1 +1,210 @@
 # resend-mail-box-be
+
+Backend for the Resend mailbox portal. It wraps the Resend API so a single
+logged-in user can read received mail, browse sent mail, compose and send, and
+keep drafts.
+
+Frontend lives in [`resend-mail-box`](https://github.com/sagar305/resend-mail-box).
+
+> **📖 New here? Read [SETUP.md](./SETUP.md).** It is the complete stepwise guide
+> for both repositories — Resend, MongoDB, Railway and Vercel setup, every
+> environment variable, and links to every library used. This README covers the
+> backend's API and internals specifically.
+
+## Stack
+
+Node 20+ · Express 5 · plain JavaScript (ESM) · MongoDB · `resend` SDK
+
+## Setup
+
+```bash
+npm install
+cp .env.example .env    # then fill it in
+npm run dev             # http://localhost:4000
+```
+
+You need a MongoDB to point `MONGO_URI` at. Either a free
+[Atlas](https://www.mongodb.com/cloud/atlas) M0 cluster (same one you can use in
+production), or a local instance:
+
+```bash
+docker run -d -p 27017:27017 --name mailbox-mongo mongo:7
+# then MONGO_URI=mongodb://localhost:27017
+```
+
+The server connects before it starts listening, so a bad `MONGO_URI` fails the
+boot with a clear error instead of serving 500s.
+
+### Environment variables
+
+| Variable | Purpose |
+| --- | --- |
+| `RESEND_API_KEY` | API key from <https://resend.com/api-keys>. |
+| `MAILBOX_ADDRESS` | The single address all mail is sent from. Bare (`you@d.com`) or with a display name (`You <you@d.com>`). Must be on a domain verified in Resend, or `onboarding@resend.dev` for testing. |
+| `MAILBOX_USER` | The one username that can sign in. |
+| `MAILBOX_PASSWORD` | That user's password. |
+| `SESSION_SECRET` | Signs the session JWT. Generate with `openssl rand -hex 32`. |
+| `PORT` | Defaults to `4000`. Railway injects this. |
+| `CORS_ORIGIN` | Allowed browser origins, comma separated. Entries may be exact (`https://app.vercel.app`), a wildcard host (`*.vercel.app`, which covers preview deploys), or `*`. Defaults to `http://localhost:5173`. Irrelevant when the frontend proxies `/api`. |
+| `MONGO_URI` | **Required.** Connection string, e.g. `mongodb+srv://…` from Atlas or `mongodb://localhost:27017`. |
+| `MONGO_DB` | Database name. Defaults to `mailbox`. |
+| `COOKIE_SAMESITE` | `lax` (default) when the browser reaches the API on its own origin; `none` when the frontend calls this API cross-site. |
+| `COOKIE_SECURE` | Defaults to true when `NODE_ENV=production`. Forced true when `COOKIE_SAMESITE=none`. |
+| `TRUST_PROXY` | Trust `X-Forwarded-*`. Defaults to true in production. |
+
+## What is stored in MongoDB, and why
+
+Resend is an email API, not a mail host, so two things it does not model are kept
+in Mongo:
+
+| Collection | Contents |
+| --- | --- |
+| `drafts` | One document per draft. `_id` is a UUID string, not an ObjectId, so the id the API returns is the id stored. Indexed on `updatedAt` descending, which is the order they are listed in. |
+| `readReceipts` | One document per message that has been **read**, with the Resend email id as `_id`. Absence means unread, so marking read is an upsert and marking unread is a delete. |
+
+Everything else (sent mail, received mail, bodies, attachment metadata) is read
+live from Resend and never mirrored. Both collections are created on first write
+— there is no migration step.
+
+## Auth
+
+`POST /api/auth/login` compares the submitted credentials against
+`MAILBOX_USER` / `MAILBOX_PASSWORD` using a constant-time comparison, then sets a
+signed JWT in an **httpOnly** cookie (`mb_session`, `SameSite=Lax`, 24-hour
+expiry; `Secure` when `NODE_ENV=production`). Every `/api/mail/*` and
+`/api/drafts/*` route requires that cookie and answers `401` without it.
+
+## API
+
+All routes are prefixed `/api`. Every route except `/health` and `/auth/*`
+requires the session cookie.
+
+| Method | Path | Notes |
+| --- | --- | --- |
+| `GET` | `/health` | Liveness check. |
+| `POST` | `/auth/login` | `{ username, password }` → sets the session cookie. |
+| `POST` | `/auth/logout` | Clears the cookie. |
+| `GET` | `/auth/me` | Current session, or `401`. |
+| `GET` | `/mail/inbox` | Received mail. `?limit=1..100` (default 20), `?after=<id>` / `?before=<id>`. Each item carries a `read` flag. |
+| `GET` | `/mail/inbox/:id` | Full received message, including body and attachment metadata. Opening it marks it read. |
+| `PATCH` | `/mail/inbox/:id/read` | `{ read: false }` to mark unread again. |
+| `GET` | `/mail/sent` | Sent mail, same pagination options. |
+| `GET` | `/mail/sent/:id` | Full sent message with body and delivery status. |
+| `POST` | `/mail/send` | `{ to, cc, bcc, subject, html, text? }`. Recipients accept an array or a comma-separated string. `202` on accept. |
+| `GET` | `/drafts` | All drafts, most recently updated first. |
+| `POST` | `/drafts` | Create. Incomplete drafts are allowed — only address *format* is validated. |
+| `GET` | `/drafts/:id` | One draft. |
+| `PUT` | `/drafts/:id` | Replace a draft's contents. |
+| `DELETE` | `/drafts/:id` | Delete. |
+| `POST` | `/drafts/:id/send` | Send the draft, then delete it. |
+
+Errors come back as `{ "error": { "message": string, "code": string \| null } }`.
+Resend's own error names are mapped onto sensible HTTP statuses (`validation_error`
+→ 422, `not_found` → 404, `rate_limit_exceeded` → 429, key/API problems → 502).
+
+Pagination is Resend's cursor scheme: pass `after=<last id on the page>` for the
+next page or `before=<first id>` for the previous one — never both.
+
+### One caveat on `/mail/sent`
+
+Resend's list-sent-emails endpoint returns everything sent by the **API key's
+account**, and takes no `from` filter. It is passed through unfiltered here: if
+the same Resend account sends mail from other addresses or other apps, that mail
+shows up under Sent too. Filtering client-side was deliberately avoided because
+it breaks cursor pagination — a 20-item page can filter down to zero while
+`has_more` is still true. Use a dedicated Resend account or API key per mailbox
+if you need Sent to show only this address.
+
+## Receiving mail
+
+Inbound mail is **pulled** from Resend's received-emails API when the frontend
+asks for it (and on a 60-second poll while the inbox is open). There is no
+webhook endpoint, so nothing needs to be publicly reachable.
+
+For inbound mail to exist at all, a domain in your Resend account needs the
+inbound **MX record**, and it must be the lowest-priority MX record for that
+domain. If the domain already handles real mail, put the record on a subdomain
+instead. Until that is configured, the inbox is simply empty — the app still
+runs and sending still works. See
+[Resend's receiving docs](https://resend.com/docs/dashboard/receiving/introduction).
+
+## Deploying to Railway
+
+`railway.json` sets the start command, and points Railway's healthcheck at
+`/api/health`. Node is pinned to 22 via `.nvmrc`.
+
+Because state lives in MongoDB rather than on disk, there is **no volume to
+provision** — the service is stateless and survives redeploys on its own.
+
+1. **Create a MongoDB Atlas cluster** (the free M0 tier is ample for one
+   mailbox). Then, under Network Access, either allowlist Railway's egress IPs
+   or use `0.0.0.0/0` with a strong database password — Atlas rejects
+   connections from unlisted addresses, and this is the usual first thing to get
+   wrong. Copy the connection string from Database → Connect → Drivers.
+2. **New Project → Deploy from GitHub repo**, pick this repo and the branch.
+3. **Set the variables** under Service → Variables:
+
+   ```
+   RESEND_API_KEY=re_...
+   MAILBOX_ADDRESS=you@yourdomain.com
+   MAILBOX_USER=admin
+   MAILBOX_PASSWORD=<something long>
+   SESSION_SECRET=<openssl rand -hex 32>
+   MONGO_URI=mongodb+srv://user:password@cluster0.xxxxx.mongodb.net/?retryWrites=true&w=majority
+   NODE_ENV=production
+   ```
+
+   Leave `PORT` alone — Railway injects it. `MONGO_DB` is optional and defaults
+   to `mailbox`.
+4. **Generate a domain** (Settings → Networking → Generate Domain) and note the
+   `*.up.railway.app` URL. The frontend needs it.
+5. Then pick one of the two ways to connect the frontend, below.
+
+Prefer to keep everything on Railway? Deploy their MongoDB template as a second
+service in the same project and use its private-network connection string as
+`MONGO_URI` — then there is no IP allowlist and Mongo is never publicly exposed.
+
+### Connecting the frontend: pick one
+
+**A. Same-origin proxy — recommended.** The Vercel app rewrites `/api/*` to this
+service, so the browser only ever talks to the Vercel domain. The session cookie
+stays first-party, nothing extra is needed here:
+
+```
+COOKIE_SAMESITE=lax
+```
+
+**B. Direct cross-origin.** The browser calls Railway straight from the Vercel
+page. This makes the session a *third-party* cookie:
+
+```
+COOKIE_SAMESITE=none
+CORS_ORIGIN=https://your-app.vercel.app,*.vercel.app
+```
+
+Be aware that Safari blocks third-party cookies by default, and Chrome and
+Firefox both offer settings that do the same — under option B those users cannot
+stay signed in. That is why A is the default.
+
+### If the deploy fails on startup
+
+The boot sequence connects to Mongo before it listens, so a Mongo problem shows
+up as a failed healthcheck. Check the deploy logs:
+
+- `tlsv1 alert internal error` / `SSL alert number 80` — **not a certificate
+  problem.** Atlas rejects connections from IPs that are not in the cluster's IP
+  Access List by failing the TLS handshake. Add `0.0.0.0/0` under Network Access
+  (Railway egress IPs are not static) and rely on a strong database password. A
+  paused M0 cluster produces the identical error, so check it is running too.
+- `MongoServerSelectionError … timed out` — Atlas unreachable. Also usually the
+  Network Access allowlist.
+- `MongoParseError` — the `MONGO_URI` is malformed. Watch for an unescaped `@`
+  or `/` in the password; those need percent-encoding.
+- `Missing required environment variable: X` — exactly what it says.
+
+## Not included
+
+Scoped out of this version: attachments on outgoing mail (received attachment
+metadata is shown but not downloadable), deleting sent or received mail (Resend
+has no delete API), server-side search (Resend's list endpoints don't support
+it), scheduled send, and conversation threading.

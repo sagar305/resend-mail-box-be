@@ -1,0 +1,28 @@
+{
+  "name": "resend-mail-box-be",
+  "version": "1.0.0",
+  "description": "Backend for the Resend mailbox portal: send mail, browse sent/received mail, and manage drafts.",
+  "main": "src/server.js",
+  "type": "module",
+  "scripts": {
+    "start": "node src/server.js",
+    "dev": "node --watch src/server.js"
+  },
+  "repository": {
+    "type": "git",
+    "url": "http://local_proxy@127.0.0.1:41729/git/sagar305/resend-mail-box-be"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "license": "ISC",
+  "dependencies": {
+    "cookie-parser": "^1.4.7",
+    "cors": "^2.8.6",
+    "dotenv": "^17.4.2",
+    "express": "^5.2.1",
+    "jsonwebtoken": "^9.0.3",
+    "mongodb": "^7.5.0",
+    "resend": "^6.18.0"
+  }
+}
