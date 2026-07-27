@@ -6,6 +6,11 @@ keep drafts.
 
 Frontend lives in [`resend-mail-box`](https://github.com/sagar305/resend-mail-box).
 
+> **📖 New here? Read [SETUP.md](./SETUP.md).** It is the complete stepwise guide
+> for both repositories — Resend, MongoDB, Railway and Vercel setup, every
+> environment variable, and links to every library used. This README covers the
+> backend's API and internals specifically.
+
 ## Stack
 
 Node 20+ · Express 5 · plain JavaScript (ESM) · MongoDB · `resend` SDK
