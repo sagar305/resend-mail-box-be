@@ -2,7 +2,7 @@ import crypto from 'node:crypto';
 import { Router } from 'express';
 import { config } from '../config.js';
 import { ApiError } from '../lib/ApiError.js';
-import { clearSession, issueSession, readSession } from '../middleware/auth.js';
+import { clearSession, issueSession, readSession, refreshSessionIfStale } from '../middleware/auth.js';
 
 export const authRouter = Router();
 
@@ -43,5 +43,7 @@ authRouter.get('/me', (req, res) => {
     res.status(401).json({ error: { message: 'Not signed in', code: 'unauthorized' } });
     return;
   }
+  // Every page load hits this, so it is the main place a session gets extended.
+  refreshSessionIfStale(res, session);
   res.json({ user: { username: session.sub }, mailboxAddress: config.mailboxAddress });
 });

@@ -48,6 +48,7 @@ boot with a clear error instead of serving 500s.
 | `CORS_ORIGIN` | Allowed browser origins, comma separated. Entries may be exact (`https://app.vercel.app`), a wildcard host (`*.vercel.app`, which covers preview deploys), or `*`. Defaults to `http://localhost:5173`. Irrelevant when the frontend proxies `/api`. |
 | `MONGO_URI` | **Required.** Connection string, e.g. `mongodb+srv://…` from Atlas or `mongodb://localhost:27017`. |
 | `MONGO_DB` | Database name. Defaults to `mailbox`. |
+| `SESSION_DAYS` | How long a login survives *without activity*. Defaults to `30`. |
 | `COOKIE_SAMESITE` | `lax` (default) when the browser reaches the API on its own origin; `none` when the frontend calls this API cross-site. |
 | `COOKIE_SECURE` | Defaults to true when `NODE_ENV=production`. Forced true when `COOKIE_SAMESITE=none`. |
 | `TRUST_PROXY` | Trust `X-Forwarded-*`. Defaults to true in production. |
@@ -70,9 +71,16 @@ live from Resend and never mirrored. Both collections are created on first write
 
 `POST /api/auth/login` compares the submitted credentials against
 `MAILBOX_USER` / `MAILBOX_PASSWORD` using a constant-time comparison, then sets a
-signed JWT in an **httpOnly** cookie (`mb_session`, `SameSite=Lax`, 24-hour
+signed JWT in an **httpOnly** cookie (`mb_session`, `SameSite=Lax`, 30-day
 expiry; `Secure` when `NODE_ENV=production`). Every `/api/mail/*` and
 `/api/drafts/*` route requires that cookie and answers `401` without it.
+
+The expiry **slides**: once a session passes the halfway point of its life, the
+next authenticated request re-issues the cookie for a fresh 30 days. So the
+window is 30 days of *inactivity*, not a hard cap — continued use never logs you
+out mid-session. Renewal is skipped while a session is still fresh, because the
+inbox polls every 60 seconds and signing a JWT that often would be waste. Change
+the window with `SESSION_DAYS`.
 
 ## API
 
