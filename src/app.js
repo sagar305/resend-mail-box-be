@@ -1,6 +1,7 @@
 import express from 'express';
 import cookieParser from 'cookie-parser';
 import { config } from './config.js';
+import { getDbStatus } from './db.js';
 import { requireAuth } from './middleware/auth.js';
 import { corsMiddleware } from './middleware/cors.js';
 import { errorHandler, notFoundHandler } from './middleware/errorHandler.js';
@@ -23,8 +24,21 @@ export function createApp() {
   app.use(express.json({ limit: '10mb' }));
   app.use(cookieParser());
 
-  // Railway's healthcheck target. Deliberately unauthenticated.
+  // Liveness only — "the process is up". This is Railway's healthcheck target,
+  // so it must not fail on a database problem: a failing healthcheck makes
+  // Railway tear the container down, which is exactly when you need it up to
+  // read /api/status. Both are unauthenticated by design.
   app.get('/api/health', (_req, res) => res.json({ ok: true }));
+
+  // Readiness — "is it actually working, and if not, why".
+  app.get('/api/status', (_req, res) => {
+    const mongo = getDbStatus();
+    res.status(mongo.connected ? 200 : 503).json({
+      ok: mongo.connected,
+      mailboxAddress: config.mailboxAddress,
+      mongo,
+    });
+  });
 
   app.use('/api/auth', authRouter);
   app.use('/api/mail', requireAuth, mailRouter);

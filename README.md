@@ -32,8 +32,10 @@ docker run -d -p 27017:27017 --name mailbox-mongo mongo:7
 # then MONGO_URI=mongodb://localhost:27017
 ```
 
-The server connects before it starts listening, so a bad `MONGO_URI` fails the
-boot with a clear error instead of serving 500s.
+The server starts listening immediately and connects to MongoDB in the
+background, retrying every 10 seconds. A database problem therefore does not take
+the process down: `GET /api/status` reports what is wrong, data routes answer
+`503`, and the app recovers on its own once the database is reachable.
 
 ### Environment variables
 
@@ -84,12 +86,13 @@ the window with `SESSION_DAYS`.
 
 ## API
 
-All routes are prefixed `/api`. Every route except `/health` and `/auth/*`
+All routes are prefixed `/api`. Every route except `/health`, `/status` and `/auth/*`
 requires the session cookie.
 
 | Method | Path | Notes |
 | --- | --- | --- |
-| `GET` | `/health` | Liveness check. |
+| `GET` | `/health` | Liveness only — is the process up. Railway's healthcheck target, so it stays `200` even when MongoDB is down. |
+| `GET` | `/status` | Readiness — `200` when MongoDB is connected, `503` with a `mongo.reason` explaining why when it is not. Start here when something is broken. |
 | `POST` | `/auth/login` | `{ username, password }` → sets the session cookie. |
 | `POST` | `/auth/logout` | Clears the cookie. |
 | `GET` | `/auth/me` | Current session, or `401`. |
@@ -196,8 +199,8 @@ stay signed in. That is why A is the default.
 
 ### If the deploy fails on startup
 
-The boot sequence connects to Mongo before it listens, so a Mongo problem shows
-up as a failed healthcheck. Check the deploy logs:
+The process stays up even when MongoDB is unreachable, so check `GET /api/status`
+first — it names the problem directly. The deploy logs carry the same diagnosis:
 
 - `tlsv1 alert internal error` / `SSL alert number 80` — **not a certificate
   problem.** Atlas rejects connections from IPs that are not in the cluster's IP
