@@ -331,8 +331,9 @@ MongoDB, so the service is stateless and survives redeploys.
 
 ### 7.1 Put your Railway URL in `vercel.json`
 
-This is **the only manual code edit in either repo.** Open `vercel.json` and
-replace the placeholder host on line 9:
+This is **the only manual code edit in either repo.** `vercel.json` already
+points at this project's own Railway service; change the host on line 9 only if
+you are deploying your own backend:
 
 ```json
 {
@@ -357,6 +358,14 @@ environment variables into rewrite destinations.** A backend URL is not a secret
 so committing it is fine.
 
 Commit and push.
+
+> **Do not also set `VITE_API_BASE_URL`.** It is inlined at build time and takes
+> precedence over this rewrite, so setting both means the rewrite is ignored and
+> every request goes cross-origin — which makes the session a third-party cookie
+> that iOS blocks outright. Use one or the other, and the rewrite is the one that
+> works everywhere. If you have both, fix this file first, confirm
+> `curl https://your-app.vercel.app/api/health` returns `{"ok":true}`, and only
+> then remove the variable.
 
 ### 7.2 Import on Vercel
 
