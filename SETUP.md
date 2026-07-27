@@ -633,7 +633,7 @@ Deliberately out of scope in this version:
   a compose window and quote the original, but nothing is grouped into threads.
 - **Multiple users or mailboxes.** One username and one from-address, both from
   environment variables.
-- **Mobile layout.** Desktop-oriented three-pane UI, light theme only.
+- **Dark mode.** Light theme only.
 
 ---
 
