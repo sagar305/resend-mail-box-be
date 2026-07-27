@@ -22,6 +22,42 @@ export function getCollections() {
   };
 }
 
+/**
+ * Turn a driver connection failure into one actionable line. The raw errors are
+ * a hundred lines of topology dump, and the most common cause — Atlas refusing
+ * a non-allowlisted IP — surfaces as a TLS alert that reads like a cert problem.
+ */
+export function describeConnectionError(error) {
+  const text = `${error?.message ?? ''} ${error?.cause?.message ?? ''}`;
+
+  if (/tlsv1 alert internal error|TLSV1_ALERT_INTERNAL_ERROR/i.test(text)) {
+    return [
+      'MongoDB refused the TLS handshake.',
+      "On Atlas this almost always means this server's IP is not in the cluster's",
+      'IP Access List (Atlas → Network Access). Railway egress IPs are not static,',
+      'so add 0.0.0.0/0 and rely on a strong database password.',
+      'A paused M0 cluster gives the same error — check the cluster is running.',
+    ].join('\n  ');
+  }
+  if (/bad auth|Authentication failed/i.test(text)) {
+    return [
+      'MongoDB rejected the credentials.',
+      'Check the username and password in MONGO_URI. Percent-encode any',
+      '@ : / ? or # in the password, or the URI parses wrongly.',
+    ].join('\n  ');
+  }
+  if (/querySrv|ENOTFOUND|EAI_AGAIN/i.test(text)) {
+    return 'MongoDB hostname could not be resolved. Check the cluster host in MONGO_URI.';
+  }
+  if (/timed out|MongoServerSelectionError/i.test(text)) {
+    return [
+      'MongoDB was unreachable before the timeout.',
+      'Check the cluster is running and that the IP Access List allows this server.',
+    ].join('\n  ');
+  }
+  return null;
+}
+
 export async function connectDb() {
   client = new MongoClient(config.mongoUri, {
     // Fail fast on a bad URI or blocked IP rather than hanging the boot.

@@ -186,8 +186,13 @@ stay signed in. That is why A is the default.
 The boot sequence connects to Mongo before it listens, so a Mongo problem shows
 up as a failed healthcheck. Check the deploy logs:
 
-- `MongoServerSelectionError … timed out` — Atlas is refusing the connection.
-  Almost always the Network Access allowlist.
+- `tlsv1 alert internal error` / `SSL alert number 80` — **not a certificate
+  problem.** Atlas rejects connections from IPs that are not in the cluster's IP
+  Access List by failing the TLS handshake. Add `0.0.0.0/0` under Network Access
+  (Railway egress IPs are not static) and rely on a strong database password. A
+  paused M0 cluster produces the identical error, so check it is running too.
+- `MongoServerSelectionError … timed out` — Atlas unreachable. Also usually the
+  Network Access allowlist.
 - `MongoParseError` — the `MONGO_URI` is malformed. Watch for an unescaped `@`
   or `/` in the password; those need percent-encoding.
 - `Missing required environment variable: X` — exactly what it says.

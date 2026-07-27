@@ -1,10 +1,18 @@
 import { createApp } from './app.js';
 import { config } from './config.js';
-import { closeDb, connectDb } from './db.js';
+import { closeDb, connectDb, describeConnectionError } from './db.js';
 
 // Connect before listening: a healthcheck that passes while the database is
 // unreachable would just hand out 500s.
-await connectDb();
+try {
+  await connectDb();
+} catch (error) {
+  const hint = describeConnectionError(error);
+  console.error('\nCould not connect to MongoDB.\n');
+  if (hint) console.error(`  ${hint}\n`);
+  console.error(`  Driver error: ${String(error?.message ?? error).split('\n')[0]}\n`);
+  process.exit(1);
+}
 console.log(`MongoDB connected (database: ${config.mongoDbName})`);
 
 const server = createApp().listen(config.port, '0.0.0.0', () => {
