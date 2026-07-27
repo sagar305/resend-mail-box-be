@@ -34,12 +34,27 @@ export function readSession(req) {
   }
 }
 
-export function requireAuth(req, _res, next) {
+/**
+ * Sliding expiry. Re-issues the cookie once a session is past the halfway point
+ * of its life, so continued use never logs you out mid-session. Deliberately not
+ * on every request: the inbox polls every 60 seconds, and signing a JWT plus
+ * sending Set-Cookie that often is pure waste.
+ */
+export function refreshSessionIfStale(res, session) {
+  if (!session?.exp) return;
+  const remainingMs = session.exp * 1000 - Date.now();
+  if (remainingMs < sessionMaxAgeMs / 2) {
+    issueSession(res, session.sub);
+  }
+}
+
+export function requireAuth(req, res, next) {
   const session = readSession(req);
   if (!session) {
     next(new ApiError(401, 'Not signed in', 'unauthorized'));
     return;
   }
   req.user = { username: session.sub };
+  refreshSessionIfStale(res, session);
   next();
 }

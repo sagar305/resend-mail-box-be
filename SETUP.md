@@ -247,8 +247,10 @@ MongoDB connected (database: mailbox)
 Mailbox API listening on port 4000
 ```
 
-The server connects to MongoDB **before** it starts listening, so a bad
-`MONGO_URI` fails the boot with one readable line rather than serving errors.
+The server starts listening straight away and connects to MongoDB in the
+background, retrying every 10 seconds. So a database problem never takes the
+process down — `curl http://localhost:4000/api/status` tells you what is wrong,
+and it recovers by itself once the database is reachable.
 
 ### 5.2 Frontend
 
@@ -306,8 +308,17 @@ MongoDB, so the service is stateless and survives redeploys.
 5. Confirm it's alive:
 
    ```bash
-   curl https://your-api.up.railway.app/api/health    # {"ok":true}
+   curl https://your-api.up.railway.app/api/health    # {"ok":true}  process is up
+   curl https://your-api.up.railway.app/api/status    # {"ok":true}  MongoDB is connected too
    ```
+
+   `/api/health` reports only that the process is alive — it is Railway's
+   healthcheck target, so it deliberately stays `200` even when MongoDB is
+   unreachable, because a failing healthcheck makes Railway tear the container
+   down precisely when you need it up to diagnose. **`/api/status` is the one that
+   tells you the truth**, returning `503` with a `mongo.reason` you can act on.
+   The backend keeps retrying the database every 10 seconds, so once you fix
+   Atlas it recovers on its own with no redeploy.
 
 > Prefer to keep everything on Railway? Deploy their MongoDB template as a
 > second service in the same project and use its **private network** connection
@@ -393,6 +404,7 @@ The server exits immediately with
 | Variable | Default | Set it when |
 | --- | --- | --- |
 | `MONGO_DB` | `mailbox` | You want a different database name |
+| `SESSION_DAYS` | `30` | You want a shorter or longer login. This is an **inactivity** window — the expiry slides forward while you keep using the app, so active use never logs you out |
 | `PORT` | `4000` | Never on Railway — it injects this |
 | `NODE_ENV` | unset | **Set `production` on Railway.** Flips `COOKIE_SECURE` and `TRUST_PROXY` defaults to true |
 | `CORS_ORIGIN` | `http://localhost:5173` | Only for the cross-origin setup. Comma-separated; `*.vercel.app` matches preview deploys |
@@ -532,11 +544,40 @@ curl https://your-app.vercel.app/api/health
 A `404` means the `vercel.json` rewrite isn't in effect — check you replaced the
 placeholder host and pushed.
 
-### Login works, but reloading logs me out
+### It logs me out by itself — especially on iPhone or iPad
 
-The session cookie isn't sticking. Either you're on the cross-origin setup
-without `COOKIE_SAMESITE=none`, or you're in Safari, which blocks third-party
-cookies entirely. Switching to the `vercel.json` rewrite fixes both.
+There is exactly one involuntary logout path in the app: **any API response of
+`401` signs you out**, including the inbox's 60-second poll. So this always means
+the session cookie stopped being accepted. Two causes:
+
+0. **The backend is simply down.** Check this first — until the fix below shipped,
+   a server outage made the app render the *login screen*, which is
+   indistinguishable from having been logged out. It now shows "Can't reach the
+   mailbox server" instead. Confirm with
+   `curl https://your-app.vercel.app/api/status`.
+
+1. **Safari is blocking the cookie.** If you deployed with `VITE_API_BASE_URL`
+   instead of the `vercel.json` rewrite, the browser calls Railway directly and
+   `mb_session` becomes a **third-party** cookie. iOS Safari has *Prevent
+   Cross-Site Tracking* on by default and blocks those outright — which is why it
+   works on desktop Chrome and fails on an iPad.
+
+   **Check:** open `https://your-app.vercel.app/api/health` on the device. This
+   works *because* of the rewrite — Vercel receives `/api` on its own domain and
+   forwards it to Railway server-side. `{"ok":true}` means the rewrite is live and
+   cookies are first-party. A `404` means it isn't, and that's your bug.
+
+   **Fix:** remove `VITE_API_BASE_URL` from Vercel, put your real Railway host in
+   `vercel.json`, redeploy.
+
+2. **The session genuinely expired.** `SESSION_DAYS` (default 30) is the allowed
+   window of *inactivity*; the expiry slides forward on use, so this only fires
+   if you truly haven't opened the app in that long.
+
+Also worth ruling out on the device: **Settings → Safari → Block All Cookies**
+must be off, and a **Private Browsing** tab discards storage far more
+aggressively. A site added to your Home Screen is a separate storage context from
+Safari, so it needs its own one-time login.
 
 ### The Inbox is empty
 

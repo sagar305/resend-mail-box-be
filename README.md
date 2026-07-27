@@ -32,8 +32,10 @@ docker run -d -p 27017:27017 --name mailbox-mongo mongo:7
 # then MONGO_URI=mongodb://localhost:27017
 ```
 
-The server connects before it starts listening, so a bad `MONGO_URI` fails the
-boot with a clear error instead of serving 500s.
+The server starts listening immediately and connects to MongoDB in the
+background, retrying every 10 seconds. A database problem therefore does not take
+the process down: `GET /api/status` reports what is wrong, data routes answer
+`503`, and the app recovers on its own once the database is reachable.
 
 ### Environment variables
 
@@ -48,6 +50,7 @@ boot with a clear error instead of serving 500s.
 | `CORS_ORIGIN` | Allowed browser origins, comma separated. Entries may be exact (`https://app.vercel.app`), a wildcard host (`*.vercel.app`, which covers preview deploys), or `*`. Defaults to `http://localhost:5173`. Irrelevant when the frontend proxies `/api`. |
 | `MONGO_URI` | **Required.** Connection string, e.g. `mongodb+srv://…` from Atlas or `mongodb://localhost:27017`. |
 | `MONGO_DB` | Database name. Defaults to `mailbox`. |
+| `SESSION_DAYS` | How long a login survives *without activity*. Defaults to `30`. |
 | `COOKIE_SAMESITE` | `lax` (default) when the browser reaches the API on its own origin; `none` when the frontend calls this API cross-site. |
 | `COOKIE_SECURE` | Defaults to true when `NODE_ENV=production`. Forced true when `COOKIE_SAMESITE=none`. |
 | `TRUST_PROXY` | Trust `X-Forwarded-*`. Defaults to true in production. |
@@ -70,18 +73,26 @@ live from Resend and never mirrored. Both collections are created on first write
 
 `POST /api/auth/login` compares the submitted credentials against
 `MAILBOX_USER` / `MAILBOX_PASSWORD` using a constant-time comparison, then sets a
-signed JWT in an **httpOnly** cookie (`mb_session`, `SameSite=Lax`, 24-hour
+signed JWT in an **httpOnly** cookie (`mb_session`, `SameSite=Lax`, 30-day
 expiry; `Secure` when `NODE_ENV=production`). Every `/api/mail/*` and
 `/api/drafts/*` route requires that cookie and answers `401` without it.
 
+The expiry **slides**: once a session passes the halfway point of its life, the
+next authenticated request re-issues the cookie for a fresh 30 days. So the
+window is 30 days of *inactivity*, not a hard cap — continued use never logs you
+out mid-session. Renewal is skipped while a session is still fresh, because the
+inbox polls every 60 seconds and signing a JWT that often would be waste. Change
+the window with `SESSION_DAYS`.
+
 ## API
 
-All routes are prefixed `/api`. Every route except `/health` and `/auth/*`
+All routes are prefixed `/api`. Every route except `/health`, `/status` and `/auth/*`
 requires the session cookie.
 
 | Method | Path | Notes |
 | --- | --- | --- |
-| `GET` | `/health` | Liveness check. |
+| `GET` | `/health` | Liveness only — is the process up. Railway's healthcheck target, so it stays `200` even when MongoDB is down. |
+| `GET` | `/status` | Readiness — `200` when MongoDB is connected, `503` with a `mongo.reason` explaining why when it is not. Start here when something is broken. |
 | `POST` | `/auth/login` | `{ username, password }` → sets the session cookie. |
 | `POST` | `/auth/logout` | Clears the cookie. |
 | `GET` | `/auth/me` | Current session, or `401`. |
@@ -188,8 +199,8 @@ stay signed in. That is why A is the default.
 
 ### If the deploy fails on startup
 
-The boot sequence connects to Mongo before it listens, so a Mongo problem shows
-up as a failed healthcheck. Check the deploy logs:
+The process stays up even when MongoDB is unreachable, so check `GET /api/status`
+first — it names the problem directly. The deploy logs carry the same diagnosis:
 
 - `tlsv1 alert internal error` / `SSL alert number 80` — **not a certificate
   problem.** Atlas rejects connections from IPs that are not in the cluster's IP

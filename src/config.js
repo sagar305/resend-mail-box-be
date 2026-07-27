@@ -45,8 +45,9 @@ export const config = {
     user: required('MAILBOX_USER'),
     password: required('MAILBOX_PASSWORD'),
     sessionSecret: required('SESSION_SECRET'),
-    // 24h, matching the agreed session length.
-    sessionMaxAgeMs: 24 * 60 * 60 * 1000,
+    // Renewed on activity (see refreshSessionIfStale), so this is the window of
+    // inactivity you are allowed, not a hard cap on staying signed in.
+    sessionMaxAgeMs: Number(process.env.SESSION_DAYS || 30) * 24 * 60 * 60 * 1000,
     cookieName: 'mb_session',
     cookieSameSite,
     // Browsers reject SameSite=None unless the cookie is also Secure, so a

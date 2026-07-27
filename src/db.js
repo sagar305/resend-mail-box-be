@@ -1,8 +1,10 @@
 import { MongoClient } from 'mongodb';
 import { config } from './config.js';
+import { ApiError } from './lib/ApiError.js';
 
 let client = null;
 let database = null;
+let lastError = null;
 
 /**
  * Point the app at a database instance. `connectDb` calls this after dialing
@@ -10,11 +12,26 @@ let database = null;
  */
 export function useDatabase(db) {
   database = db;
+  lastError = null;
+}
+
+/** Whether the database is usable, and if not, why — for GET /api/status. */
+export function getDbStatus() {
+  if (database) return { connected: true, state: 'connected', reason: null };
+  // No error yet means the first attempt is still in flight, which is different
+  // from having tried and failed.
+  if (!lastError) return { connected: false, state: 'connecting', reason: null };
+  return {
+    connected: false,
+    state: 'error',
+    reason: describeConnectionError(lastError) ?? lastError.message,
+  };
 }
 
 export function getCollections() {
   if (!database) {
-    throw new Error('Database not connected. Call connectDb() before handling requests.');
+    // 503, not 500: the app is fine, its database is not — and that is temporary.
+    throw new ApiError(503, 'Database unavailable. See GET /api/status.', 'database_unavailable');
   }
   return {
     drafts: database.collection('drafts'),
@@ -59,17 +76,50 @@ export function describeConnectionError(error) {
 }
 
 export async function connectDb() {
-  client = new MongoClient(config.mongoUri, {
-    // Fail fast on a bad URI or blocked IP rather than hanging the boot.
-    serverSelectionTimeoutMS: 10_000,
-  });
-  await client.connect();
-  useDatabase(client.db(config.mongoDbName));
+  try {
+    client = new MongoClient(config.mongoUri, {
+      // Fail fast on a bad URI or blocked IP rather than hanging the boot.
+      serverSelectionTimeoutMS: 10_000,
+    });
+    await client.connect();
+    useDatabase(client.db(config.mongoDbName));
 
-  // Drafts are always listed most-recently-edited first.
-  await getCollections().drafts.createIndex({ updatedAt: -1 });
+    // Drafts are always listed most-recently-edited first.
+    await getCollections().drafts.createIndex({ updatedAt: -1 });
 
-  return database;
+    return database;
+  } catch (error) {
+    lastError = error;
+    // Drop the failed client so the next attempt starts from a clean socket pool.
+    await client?.close().catch(() => {});
+    client = null;
+    database = null;
+    throw error;
+  }
+}
+
+/**
+ * Keep trying to connect, forever, logging the diagnosis on each failure.
+ * The alternative — exiting on a failed connection — takes the whole process
+ * down, so the reason is only visible in platform logs and a fix needs a
+ * redeploy. This way /api/status can report the problem over HTTP and the app
+ * recovers on its own once the database is reachable.
+ */
+export function connectDbWithRetry({ intervalMs = 10_000 } = {}) {
+  const attempt = async () => {
+    try {
+      await connectDb();
+      console.log(`MongoDB connected (database: ${config.mongoDbName})`);
+    } catch (error) {
+      const hint = describeConnectionError(error);
+      console.error('\nMongoDB connection failed. Serving 503s until it recovers.\n');
+      if (hint) console.error(`  ${hint}\n`);
+      console.error(`  Driver error: ${String(error?.message ?? error).split('\n')[0]}`);
+      console.error(`  Retrying in ${intervalMs / 1000}s. Check GET /api/status.\n`);
+      setTimeout(attempt, intervalMs);
+    }
+  };
+  return attempt();
 }
 
 export async function closeDb() {
