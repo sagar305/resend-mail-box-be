@@ -399,11 +399,14 @@ The server exits immediately with
 | `SESSION_SECRET` | Signs the session JWT. `openssl rand -hex 32` |
 | `MONGO_URI` | `mongodb+srv://…` (Atlas) or `mongodb://localhost:27017` |
 
-### Backend — optional (7)
+### Backend — optional (10)
 
 | Variable | Default | Set it when |
 | --- | --- | --- |
 | `MONGO_DB` | `mailbox` | You want a different database name |
+| `MAX_ATTACHMENT_COUNT` | `10` | You want to allow more or fewer files per email |
+| `MAX_ATTACHMENT_MB` | `10` | You want a different per-file cap. Clamped to the total below |
+| `MAX_ATTACHMENTS_TOTAL_MB` | `20` | You want a different cap for all files on one email. **Max 30** — Resend's ceiling is 40 MB after base64, and the server refuses to boot above it |
 | `SESSION_DAYS` | `30` | You want a shorter or longer login. This is an **inactivity** window — the expiry slides forward while you keep using the app, so active use never logs you out |
 | `PORT` | `4000` | Never on Railway — it injects this |
 | `NODE_ENV` | unset | **Set `production` on Railway.** Flips `COOKIE_SECURE` and `TRUST_PROXY` defaults to true |
@@ -604,8 +607,13 @@ the email you registered your Resend account with. Verify your own domain
 
 Deliberately out of scope in this version:
 
-- **Attachments on outgoing mail.** Received attachments are listed with name and
-  size but are not downloadable.
+- **Downloading received attachments.** They are listed with name and size, but
+  fetching the file is not wired up. Resend does expose signed download URLs
+  (`resend.emails.receiving.attachments.get()`), so this is a small addition.
+- **Attachments on drafts.** You can attach files to an outgoing email (up to 10
+  files, 10 MB each, 20 MB per email — see `MAX_ATTACHMENTS_TOTAL_MB`), but saving
+  a draft keeps the text only. A Mongo document caps at 16 MB, so keeping the
+  files would mean GridFS or object storage.
 - **Deleting sent or received mail.** Resend has no delete API, so this could
   only ever be a local hide.
 - **Search.** Resend's list endpoints offer cursor pagination but no search, so

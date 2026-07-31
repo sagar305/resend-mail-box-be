@@ -134,7 +134,7 @@ export async function getReceived(id) {
   };
 }
 
-export async function sendMail({ to, cc, bcc, subject, html, text }) {
+export async function sendMail({ to, cc, bcc, subject, html, text, attachments }) {
   const payload = {
     from: config.mailboxAddress,
     to,
@@ -144,6 +144,15 @@ export async function sendMail({ to, cc, bcc, subject, html, text }) {
   };
   if (cc.length) payload.cc = cc;
   if (bcc.length) payload.bcc = bcc;
+  if (attachments?.length) {
+    // Rebuilt field by field: our attachments carry validation leftovers Resend
+    // has no use for, and `content` must be the bare base64 string.
+    payload.attachments = attachments.map(({ filename, content, contentType }) => ({
+      filename,
+      content,
+      ...(contentType ? { contentType } : {}),
+    }));
+  }
 
   const result = unwrap(await resend.emails.send(payload));
   return { id: result.id };

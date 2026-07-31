@@ -20,8 +20,10 @@ export function createApp() {
   }
 
   app.use(corsMiddleware);
-  // Generous limit: an HTML body with inline images is easily over the 100kb default.
-  app.use(express.json({ limit: '10mb' }));
+  // Sized from the attachment budget (config.jsonBodyLimitBytes) rather than set
+  // independently: base64 costs a third on top of every file, and an HTML body
+  // with inline images is already well over the 100kb default on its own.
+  app.use(express.json({ limit: config.jsonBodyLimitBytes }));
   app.use(cookieParser());
 
   // Liveness only — "the process is up". This is Railway's healthcheck target,

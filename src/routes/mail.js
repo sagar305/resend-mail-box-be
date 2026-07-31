@@ -1,4 +1,5 @@
 import { Router } from 'express';
+import { attachmentLimits, parseAttachments } from '../lib/attachments.js';
 import { assertSendable, normalizeComposePayload, parsePagination } from '../lib/validation.js';
 import { getReceived, getSent, listReceived, listSent, sendMail } from '../services/resendClient.js';
 import { isRead, markRead, markUnread, withReadState } from '../services/readState.js';
@@ -35,8 +36,18 @@ mailRouter.get('/sent/:id', asyncRoute(async (req, res) => {
   res.json({ message: await getSent(req.params.id) });
 }));
 
+// Lets the compose form reject an oversized or blocked file before it spends time
+// reading and encoding it, using the same numbers this API enforces on send.
+mailRouter.get('/limits', (_req, res) => {
+  res.json({ attachments: attachmentLimits() });
+});
+
 mailRouter.post('/send', asyncRoute(async (req, res) => {
-  const payload = normalizeComposePayload(req.body ?? {});
+  const body = req.body ?? {};
+  const payload = {
+    ...normalizeComposePayload(body),
+    attachments: parseAttachments(body.attachments),
+  };
   assertSendable(payload);
   const { id } = await sendMail(payload);
   res.status(202).json({ id });

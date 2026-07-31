@@ -29,6 +29,53 @@ if (!['lax', 'strict', 'none'].includes(cookieSameSite)) {
   throw new Error(`COOKIE_SAMESITE must be lax, strict or none (got "${cookieSameSite}")`);
 }
 
+const MB = 1024 * 1024;
+
+function parseMegabytes(value, fallback, name) {
+  if (value === undefined || value === '') return fallback * MB;
+  const megabytes = Number(value);
+  if (!Number.isFinite(megabytes) || megabytes <= 0) {
+    throw new Error(`${name} must be a positive number of megabytes (got "${value}")`);
+  }
+  return Math.round(megabytes * MB);
+}
+
+// Resend's hard ceiling is 40 MB per email measured AFTER base64 encoding, which
+// is what our own limits below have to stay under once inflated by 4/3.
+const RESEND_MAX_ENCODED_BYTES = 40 * MB;
+
+const attachments = {
+  maxCount: Number(process.env.MAX_ATTACHMENT_COUNT || 10),
+  maxFileBytes: parseMegabytes(process.env.MAX_ATTACHMENT_MB, 10, 'MAX_ATTACHMENT_MB'),
+  maxTotalBytes: parseMegabytes(process.env.MAX_ATTACHMENTS_TOTAL_MB, 20, 'MAX_ATTACHMENTS_TOTAL_MB'),
+  /**
+   * Extensions the big mailbox providers (Gmail, Outlook) reject outright.
+   * Resend itself accepts them, so this is our policy, not the API's — but a mail
+   * that is guaranteed to bounce is worth refusing before it costs an API call.
+   */
+  blockedExtensions: [
+    'ade', 'adp', 'apk', 'appx', 'appxbundle', 'bat', 'cab', 'chm', 'cmd', 'com', 'cpl',
+    'diagcab', 'diagcfg', 'diagpack', 'dll', 'dmg', 'ex', 'ex_', 'exe', 'gadget', 'hta',
+    'img', 'ins', 'iso', 'isp', 'jar', 'jnlp', 'js', 'jse', 'lib', 'lnk', 'mde', 'msc',
+    'msi', 'msix', 'msixbundle', 'msp', 'mst', 'nsh', 'pif', 'ps1', 'scr', 'sct', 'shb',
+    'sys', 'vb', 'vbe', 'vbs', 'vhd', 'vxd', 'wsc', 'wsf', 'wsh', 'xll',
+  ],
+};
+
+if (attachments.maxFileBytes > attachments.maxTotalBytes) {
+  attachments.maxFileBytes = attachments.maxTotalBytes;
+}
+if (!Number.isInteger(attachments.maxCount) || attachments.maxCount < 1) {
+  throw new Error(`MAX_ATTACHMENT_COUNT must be a positive integer (got "${process.env.MAX_ATTACHMENT_COUNT}")`);
+}
+// Base64 costs 4 bytes per 3, so the encoded payload is what has to fit in 40 MB.
+if (Math.ceil(attachments.maxTotalBytes / 3) * 4 > RESEND_MAX_ENCODED_BYTES) {
+  throw new Error(
+    `MAX_ATTACHMENTS_TOTAL_MB is too large: ${(attachments.maxTotalBytes / MB).toFixed(1)} MB of files ` +
+    'exceeds 40 MB once base64 encoded, which Resend rejects. Use 30 or less.',
+  );
+}
+
 export const config = {
   port: Number(process.env.PORT || 4000),
   corsOrigins,
@@ -55,6 +102,12 @@ export const config = {
     cookieSecure:
       cookieSameSite === 'none' ? true : parseBoolean(process.env.COOKIE_SECURE, isProduction),
   },
+
+  attachments,
+  // The JSON body has to hold every attachment base64 encoded plus the HTML body,
+  // so it is derived from the attachment budget rather than set independently —
+  // otherwise raising one silently leaves the other as the real limit.
+  jsonBodyLimitBytes: Math.ceil(attachments.maxTotalBytes / 3) * 4 + 2 * MB,
 
   // Holds drafts and read/unread state — the two things Resend does not model.
   mongoUri: required('MONGO_URI'),
