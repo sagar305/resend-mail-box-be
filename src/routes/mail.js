@@ -2,8 +2,8 @@ import { Router } from 'express';
 import { attachmentLimits, parseAttachments } from '../lib/attachments.js';
 import { assertSendable, normalizeComposePayload, parsePagination } from '../lib/validation.js';
 import {
+  getAttachment,
   getReceived,
-  getReceivedAttachment,
   getSent,
   listReceived,
   listSent,
@@ -28,20 +28,23 @@ mailRouter.get('/inbox/:id', asyncRoute(async (req, res) => {
 }));
 
 /**
- * Downloads a received attachment. Resend's signed URL is handed to the browser
- * as a redirect rather than streamed through here: it saves this service the
- * bandwidth of every file, and the URL expires on its own. Requesting it is
- * behind the session, so the redirect is only ever issued to a signed-in user.
+ * Downloads an attachment. Resend's signed URL is handed to the browser as a
+ * redirect rather than streamed through here: it saves this service the bandwidth
+ * of every file, and the URL expires on its own. Requesting it is behind the
+ * session, so the redirect is only ever issued to a signed-in user.
  *
  * The URL is resolved per request, never baked into the page — it is short-lived,
  * and a link rendered minutes ago would already be dead.
  */
-mailRouter.get('/inbox/:id/attachments/:attachmentId', asyncRoute(async (req, res) => {
-  const attachment = await getReceivedAttachment(req.params.id, req.params.attachmentId);
+const downloadRoute = (folder) => asyncRoute(async (req, res) => {
+  const attachment = await getAttachment(folder, req.params.id, req.params.attachmentId);
   // Nothing may cache a URL that stops working, least of all a shared proxy.
   res.set('Cache-Control', 'no-store, private');
   res.redirect(302, attachment.downloadUrl);
-}));
+});
+
+mailRouter.get('/inbox/:id/attachments/:attachmentId', downloadRoute('inbox'));
+mailRouter.get('/sent/:id/attachments/:attachmentId', downloadRoute('sent'));
 
 mailRouter.patch('/inbox/:id/read', asyncRoute(async (req, res) => {
   const read = req.body?.read !== false;

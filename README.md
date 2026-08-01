@@ -104,7 +104,8 @@ requires the session cookie.
 | `GET` | `/mail/inbox/:id/attachments/:attachmentId` | Download a received attachment. Answers `302` to Resend's signed URL — follow redirects. |
 | `PATCH` | `/mail/inbox/:id/read` | `{ read: false }` to mark unread again. |
 | `GET` | `/mail/sent` | Sent mail, same pagination options. |
-| `GET` | `/mail/sent/:id` | Full sent message with body and delivery status. |
+| `GET` | `/mail/sent/:id` | Full sent message with body, delivery status and attachment metadata. |
+| `GET` | `/mail/sent/:id/attachments/:attachmentId` | Download an attachment off a sent message. Same `302` as the inbox one. |
 | `GET` | `/mail/limits` | The attachment limits below, so the compose form can enforce the same ones before uploading: `{ attachments: { maxCount, maxFileBytes, maxTotalBytes, blockedExtensions } }`. |
 | `POST` | `/mail/send` | `{ to, cc, bcc, subject, html, text?, attachments? }`. Recipients accept an array or a comma-separated string. `202` on accept. |
 | `GET` | `/drafts` | All drafts, most recently updated first. |
@@ -173,12 +174,13 @@ files would blow through, so `POST /drafts` and `PUT /drafts/:id` ignore the
 field — files have to be re-attached before sending. Storing them properly means
 GridFS or object storage.
 
-### Downloading a received attachment
+### Downloading an attachment
 
-Resend does not serve inbound attachment bytes from the API; it issues a
-short-lived **signed URL**. `GET /mail/inbox/:id/attachments/:attachmentId` looks
-that URL up and answers `302`, so any client just has to follow redirects
-(`curl -L`, or a plain link in a browser).
+Resend does not serve attachment bytes from the API; it issues a short-lived
+**signed URL**. `GET /mail/inbox/:id/attachments/:attachmentId` (received) and
+`GET /mail/sent/:id/attachments/:attachmentId` (sent) look that URL up and answer
+`302`, so any client just has to follow redirects (`curl -L`, or a plain link in
+a browser).
 
 Handing the URL over rather than streaming the file through this service saves it
 the bandwidth of every download, and the URL expires on its own. Asking for it
@@ -196,6 +198,18 @@ would show the same image twice and put a paperclip on mail that has no real
 attachment. `attachmentCount` counts the filtered list, so the badge agrees with
 what the reading pane shows. Inline parts *without* a Content-ID are nothing to
 do with the body and stay in the list.
+
+**Where the two folders differ.** A received message carries its attachment
+metadata inline, so `GET /mail/inbox/:id` costs one Resend call. A *sent* one does
+not — Resend's email object has no attachment field at all — so `GET /mail/sent/:id`
+makes a second call to `/emails/{id}/attachments` alongside the message. That call
+is deliberately non-fatal: if it fails, the message is returned with an empty
+attachment list and the reason is logged, because losing the whole view over a
+file list is worse than showing the mail without it.
+
+The same asymmetry is why **sent list rows carry no paperclip**. `/mail/sent`
+would need one extra request per row to know, and a 20-row page is not worth 20
+API calls; open the message to see its files. Inbox rows have the count for free.
 
 ### One caveat on `/mail/sent`
 

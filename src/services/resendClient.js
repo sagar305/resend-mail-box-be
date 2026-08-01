@@ -77,6 +77,15 @@ function fileAttachments(email) {
   return toArray(email.attachments).filter((attachment) => !isInlineBodyPart(attachment));
 }
 
+function normalizeAttachment(attachment) {
+  return {
+    id: attachment.id ?? null,
+    filename: attachment.filename ?? null,
+    contentType: attachment.content_type ?? null,
+    size: attachment.size ?? null,
+  };
+}
+
 function normalizeReceived(email) {
   return {
     id: email.id,
@@ -113,13 +122,35 @@ export async function listSent(pagination) {
   };
 }
 
+/**
+ * Sent mail carries no attachment metadata on the email object itself — Resend
+ * keeps it behind a separate endpoint — so it has to be asked for on the side.
+ * A failure there must not take the message with it: the body is what was asked
+ * for, and losing the whole view because a file list would not load is worse
+ * than showing the mail without it.
+ */
+async function listSentAttachments(emailId) {
+  const { data, error } = await resend.emails.attachments.list({ emailId });
+  if (error) {
+    console.error(`Could not list attachments for sent email ${emailId}: ${error.message}`);
+    return [];
+  }
+  return (data?.data || [])
+    .filter((attachment) => !isInlineBodyPart(attachment))
+    .map(normalizeAttachment);
+}
+
 export async function getSent(id) {
-  const email = unwrap(await resend.emails.get(id));
+  const [email, attachments] = await Promise.all([
+    resend.emails.get(id).then(unwrap),
+    listSentAttachments(id),
+  ]);
   return {
     ...normalizeSent(email),
     html: email.html ?? null,
     text: email.text ?? null,
     preview: buildPreview(email.html, email.text),
+    attachments,
   };
 }
 
@@ -139,24 +170,21 @@ export async function getReceived(id) {
     html: email.html ?? null,
     text: email.text ?? null,
     preview: buildPreview(email.html, email.text),
-    attachments: fileAttachments(email).map((attachment) => ({
-      id: attachment.id ?? null,
-      filename: attachment.filename ?? null,
-      contentType: attachment.content_type ?? null,
-      size: attachment.size ?? null,
-    })),
+    attachments: fileAttachments(email).map(normalizeAttachment),
   };
 }
 
 /**
- * Resend keeps received attachments behind a short-lived signed URL rather than
- * serving the bytes from the API, so this is metadata plus that URL — see the
- * download route in routes/mail.js for why it is handed out rather than proxied.
+ * Resend keeps attachments behind a short-lived signed URL rather than serving
+ * the bytes from the API, so this is metadata plus that URL — see the download
+ * routes in routes/mail.js for why it is handed out rather than proxied.
+ *
+ * Received and sent mail have separate endpoints for it; `folder` picks one.
  */
-export async function getReceivedAttachment(emailId, attachmentId) {
-  const attachment = unwrap(
-    await resend.emails.receiving.attachments.get({ emailId, id: attachmentId }),
-  );
+export async function getAttachment(folder, emailId, attachmentId) {
+  const endpoint =
+    folder === 'inbox' ? resend.emails.receiving.attachments : resend.emails.attachments;
+  const attachment = unwrap(await endpoint.get({ emailId, id: attachmentId }));
   return {
     id: attachment.id,
     filename: attachment.filename ?? 'attachment',
