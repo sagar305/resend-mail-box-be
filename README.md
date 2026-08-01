@@ -54,6 +54,9 @@ the process down: `GET /api/status` reports what is wrong, data routes answer
 | `COOKIE_SAMESITE` | `lax` (default) when the browser reaches the API on its own origin; `none` when the frontend calls this API cross-site. |
 | `COOKIE_SECURE` | Defaults to true when `NODE_ENV=production`. Forced true when `COOKIE_SAMESITE=none`. |
 | `TRUST_PROXY` | Trust `X-Forwarded-*`. Defaults to true in production. |
+| `MAX_ATTACHMENT_COUNT` | Files allowed on one outgoing email. Defaults to `10`. |
+| `MAX_ATTACHMENT_MB` | Largest single attachment. Defaults to `10`. Clamped to the total below. |
+| `MAX_ATTACHMENTS_TOTAL_MB` | All attachments on one email combined. Defaults to `20`. Cannot exceed `30` — Resend's ceiling is 40 MB *after* base64. |
 
 ## What is stored in MongoDB, and why
 
@@ -98,10 +101,12 @@ requires the session cookie.
 | `GET` | `/auth/me` | Current session, or `401`. |
 | `GET` | `/mail/inbox` | Received mail. `?limit=1..100` (default 20), `?after=<id>` / `?before=<id>`. Each item carries a `read` flag. |
 | `GET` | `/mail/inbox/:id` | Full received message, including body and attachment metadata. Opening it marks it read. |
+| `GET` | `/mail/inbox/:id/attachments/:attachmentId` | Download a received attachment. Answers `302` to Resend's signed URL — follow redirects. |
 | `PATCH` | `/mail/inbox/:id/read` | `{ read: false }` to mark unread again. |
 | `GET` | `/mail/sent` | Sent mail, same pagination options. |
 | `GET` | `/mail/sent/:id` | Full sent message with body and delivery status. |
-| `POST` | `/mail/send` | `{ to, cc, bcc, subject, html, text? }`. Recipients accept an array or a comma-separated string. `202` on accept. |
+| `GET` | `/mail/limits` | The attachment limits below, so the compose form can enforce the same ones before uploading: `{ attachments: { maxCount, maxFileBytes, maxTotalBytes, blockedExtensions } }`. |
+| `POST` | `/mail/send` | `{ to, cc, bcc, subject, html, text?, attachments? }`. Recipients accept an array or a comma-separated string. `202` on accept. |
 | `GET` | `/drafts` | All drafts, most recently updated first. |
 | `POST` | `/drafts` | Create. Incomplete drafts are allowed — only address *format* is validated. |
 | `GET` | `/drafts/:id` | One draft. |
@@ -115,6 +120,82 @@ Resend's own error names are mapped onto sensible HTTP statuses (`validation_err
 
 Pagination is Resend's cursor scheme: pass `after=<last id on the page>` for the
 next page or `before=<first id>` for the previous one — never both.
+
+### Attachments on `/mail/send`
+
+Each entry is `{ filename, content, contentType? }`, where `content` is the file
+**base64 encoded** (a `data:…;base64,` prefix is tolerated and stripped).
+`contentType` is optional — Resend infers it from the filename — and is dropped
+unless it looks like a MIME type.
+
+```json
+{
+  "to": "someone@example.com",
+  "subject": "Invoice",
+  "html": "<p>Attached.</p>",
+  "attachments": [{ "filename": "invoice.pdf", "content": "JVBERi0xLjQK…" }]
+}
+```
+
+Everything is validated before Resend is called, and every rejection is a `422`
+with a message written to be shown to the user as-is:
+
+| Rule | Default | Env |
+| --- | --- | --- |
+| Files per email | 10 | `MAX_ATTACHMENT_COUNT` |
+| Size of one file | 10 MB | `MAX_ATTACHMENT_MB` |
+| Size of all files in one email | 20 MB | `MAX_ATTACHMENTS_TOTAL_MB` |
+| Blocked extensions | `.exe`, `.bat`, `.js`, `.jar`, … (54 in total) | — |
+
+Filenames are reduced to their leaf (`../../etc/passwd` becomes `passwd`), and
+content must be well-formed base64 and non-empty.
+
+The blocklist is *our* policy, not Resend's: Resend would send a `.exe` happily,
+but Gmail and Outlook reject it on arrival, so it is refused here rather than
+bounced later. The list is `config.attachments.blockedExtensions` in
+`src/config.js`.
+
+Resend's own hard ceiling is **40 MB per email after base64 encoding**, which is
+about 30 MB of actual files. `MAX_ATTACHMENTS_TOTAL_MB` is checked against that at
+startup and the process refuses to boot if it is set higher. The
+`express.json()` body limit is derived from the same number (total × 4/3 + 2 MB
+of headroom for the HTML body) so the two can never drift apart, and a body over
+it comes back as a `413` with a readable message rather than a bare 500.
+
+Two things to know if you raise these limits: the whole file is buffered in
+memory as a base64 string while the request is handled, and your proxies get a
+vote — a Vercel `/api/*` rewrite and Railway both sit in front of this service and
+will cut off an oversized body before Express ever sees it. Test a large send
+against production, not just locally.
+
+**Drafts do not carry attachments.** A Mongo document caps at 16 MB, which base64
+files would blow through, so `POST /drafts` and `PUT /drafts/:id` ignore the
+field — files have to be re-attached before sending. Storing them properly means
+GridFS or object storage.
+
+### Downloading a received attachment
+
+Resend does not serve inbound attachment bytes from the API; it issues a
+short-lived **signed URL**. `GET /mail/inbox/:id/attachments/:attachmentId` looks
+that URL up and answers `302`, so any client just has to follow redirects
+(`curl -L`, or a plain link in a browser).
+
+Handing the URL over rather than streaming the file through this service saves it
+the bandwidth of every download, and the URL expires on its own. Asking for it
+still requires the session, so a redirect is only ever issued to a signed-in user
+— but note that once issued, the URL itself is unauthenticated until it expires.
+Swap `res.redirect` in `routes/mail.js` for a `fetch` and `pipe` if you would
+rather the bytes never leave your origin. The response is `Cache-Control:
+no-store` either way, since a cached redirect to an expired URL is a broken link.
+
+**Inline images are filtered out of the attachment list.** An attachment with
+`content_disposition: inline` *and* a `content_id` is a body part — a signature
+logo, an embedded screenshot — and bodies are fetched with `html_format:
+'data_uri'`, so it is already rendered inside the HTML. Listing it as a file too
+would show the same image twice and put a paperclip on mail that has no real
+attachment. `attachmentCount` counts the filtered list, so the badge agrees with
+what the reading pane shows. Inline parts *without* a Content-ID are nothing to
+do with the body and stay in the list.
 
 ### One caveat on `/mail/sent`
 
@@ -215,7 +296,7 @@ first — it names the problem directly. The deploy logs carry the same diagnosi
 
 ## Not included
 
-Scoped out of this version: attachments on outgoing mail (received attachment
-metadata is shown but not downloadable), deleting sent or received mail (Resend
+Scoped out of this version: attachments on drafts (see above),
+deleting sent or received mail (Resend
 has no delete API), server-side search (Resend's list endpoints don't support
 it), scheduled send, and conversation threading.

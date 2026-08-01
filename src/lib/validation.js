@@ -86,7 +86,9 @@ export function assertSendable(payload) {
   if (!payload.subject) {
     throw new ApiError(422, 'A subject is required', 'validation_error');
   }
-  if (isBlankHtml(payload.html)) {
+  // A file with nothing written above it is a normal thing to send, so an empty
+  // body only counts as a mistake when there is no attachment either.
+  if (isBlankHtml(payload.html) && !payload.attachments?.length) {
     throw new ApiError(422, 'The message body is empty', 'validation_error');
   }
 }

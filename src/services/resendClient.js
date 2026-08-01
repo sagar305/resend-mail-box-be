@@ -63,6 +63,20 @@ function normalizeSent(email) {
   };
 }
 
+/**
+ * An inline part carrying a Content-ID is body content — a signature logo, an
+ * embedded screenshot — and we fetch bodies with `html_format: 'data_uri'`, so it
+ * is already rendered inside the HTML. Listing it as a file too would show the
+ * same image twice and put a paperclip on mail that has no real attachment.
+ */
+function isInlineBodyPart(attachment) {
+  return attachment.content_disposition === 'inline' && Boolean(attachment.content_id);
+}
+
+function fileAttachments(email) {
+  return toArray(email.attachments).filter((attachment) => !isInlineBodyPart(attachment));
+}
+
 function normalizeReceived(email) {
   return {
     id: email.id,
@@ -75,7 +89,7 @@ function normalizeReceived(email) {
     receivedFor: toArray(email.received_for),
     subject: email.subject || '(no subject)',
     createdAt: email.created_at,
-    attachmentCount: toArray(email.attachments).length,
+    attachmentCount: fileAttachments(email).length,
     messageId: email.message_id ?? null,
   };
 }
@@ -125,7 +139,7 @@ export async function getReceived(id) {
     html: email.html ?? null,
     text: email.text ?? null,
     preview: buildPreview(email.html, email.text),
-    attachments: toArray(email.attachments).map((attachment) => ({
+    attachments: fileAttachments(email).map((attachment) => ({
       id: attachment.id ?? null,
       filename: attachment.filename ?? null,
       contentType: attachment.content_type ?? null,
@@ -134,7 +148,26 @@ export async function getReceived(id) {
   };
 }
 
-export async function sendMail({ to, cc, bcc, subject, html, text }) {
+/**
+ * Resend keeps received attachments behind a short-lived signed URL rather than
+ * serving the bytes from the API, so this is metadata plus that URL — see the
+ * download route in routes/mail.js for why it is handed out rather than proxied.
+ */
+export async function getReceivedAttachment(emailId, attachmentId) {
+  const attachment = unwrap(
+    await resend.emails.receiving.attachments.get({ emailId, id: attachmentId }),
+  );
+  return {
+    id: attachment.id,
+    filename: attachment.filename ?? 'attachment',
+    contentType: attachment.content_type ?? null,
+    size: attachment.size ?? null,
+    downloadUrl: attachment.download_url,
+    expiresAt: attachment.expires_at ?? null,
+  };
+}
+
+export async function sendMail({ to, cc, bcc, subject, html, text, attachments }) {
   const payload = {
     from: config.mailboxAddress,
     to,
@@ -144,6 +177,15 @@ export async function sendMail({ to, cc, bcc, subject, html, text }) {
   };
   if (cc.length) payload.cc = cc;
   if (bcc.length) payload.bcc = bcc;
+  if (attachments?.length) {
+    // Rebuilt field by field: our attachments carry validation leftovers Resend
+    // has no use for, and `content` must be the bare base64 string.
+    payload.attachments = attachments.map(({ filename, content, contentType }) => ({
+      filename,
+      content,
+      ...(contentType ? { contentType } : {}),
+    }));
+  }
 
   const result = unwrap(await resend.emails.send(payload));
   return { id: result.id };
