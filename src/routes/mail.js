@@ -1,7 +1,14 @@
 import { Router } from 'express';
 import { attachmentLimits, parseAttachments } from '../lib/attachments.js';
 import { assertSendable, normalizeComposePayload, parsePagination } from '../lib/validation.js';
-import { getReceived, getSent, listReceived, listSent, sendMail } from '../services/resendClient.js';
+import {
+  getReceived,
+  getReceivedAttachment,
+  getSent,
+  listReceived,
+  listSent,
+  sendMail,
+} from '../services/resendClient.js';
 import { isRead, markRead, markUnread, withReadState } from '../services/readState.js';
 
 export const mailRouter = Router();
@@ -18,6 +25,22 @@ mailRouter.get('/inbox/:id', asyncRoute(async (req, res) => {
   // Opening a message marks it read, the same as any mail client.
   await markRead(message.id);
   res.json({ message: { ...message, read: true } });
+}));
+
+/**
+ * Downloads a received attachment. Resend's signed URL is handed to the browser
+ * as a redirect rather than streamed through here: it saves this service the
+ * bandwidth of every file, and the URL expires on its own. Requesting it is
+ * behind the session, so the redirect is only ever issued to a signed-in user.
+ *
+ * The URL is resolved per request, never baked into the page — it is short-lived,
+ * and a link rendered minutes ago would already be dead.
+ */
+mailRouter.get('/inbox/:id/attachments/:attachmentId', asyncRoute(async (req, res) => {
+  const attachment = await getReceivedAttachment(req.params.id, req.params.attachmentId);
+  // Nothing may cache a URL that stops working, least of all a shared proxy.
+  res.set('Cache-Control', 'no-store, private');
+  res.redirect(302, attachment.downloadUrl);
 }));
 
 mailRouter.patch('/inbox/:id/read', asyncRoute(async (req, res) => {

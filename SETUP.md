@@ -607,9 +607,6 @@ the email you registered your Resend account with. Verify your own domain
 
 Deliberately out of scope in this version:
 
-- **Downloading received attachments.** They are listed with name and size, but
-  fetching the file is not wired up. Resend does expose signed download URLs
-  (`resend.emails.receiving.attachments.get()`), so this is a small addition.
 - **Attachments on drafts.** You can attach files to an outgoing email (up to 10
   files, 10 MB each, 20 MB per email — see `MAX_ATTACHMENTS_TOTAL_MB`), but saving
   a draft keeps the text only. A Mongo document caps at 16 MB, so keeping the

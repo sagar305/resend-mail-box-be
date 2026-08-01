@@ -101,6 +101,7 @@ requires the session cookie.
 | `GET` | `/auth/me` | Current session, or `401`. |
 | `GET` | `/mail/inbox` | Received mail. `?limit=1..100` (default 20), `?after=<id>` / `?before=<id>`. Each item carries a `read` flag. |
 | `GET` | `/mail/inbox/:id` | Full received message, including body and attachment metadata. Opening it marks it read. |
+| `GET` | `/mail/inbox/:id/attachments/:attachmentId` | Download a received attachment. Answers `302` to Resend's signed URL — follow redirects. |
 | `PATCH` | `/mail/inbox/:id/read` | `{ read: false }` to mark unread again. |
 | `GET` | `/mail/sent` | Sent mail, same pagination options. |
 | `GET` | `/mail/sent/:id` | Full sent message with body and delivery status. |
@@ -171,6 +172,30 @@ against production, not just locally.
 files would blow through, so `POST /drafts` and `PUT /drafts/:id` ignore the
 field — files have to be re-attached before sending. Storing them properly means
 GridFS or object storage.
+
+### Downloading a received attachment
+
+Resend does not serve inbound attachment bytes from the API; it issues a
+short-lived **signed URL**. `GET /mail/inbox/:id/attachments/:attachmentId` looks
+that URL up and answers `302`, so any client just has to follow redirects
+(`curl -L`, or a plain link in a browser).
+
+Handing the URL over rather than streaming the file through this service saves it
+the bandwidth of every download, and the URL expires on its own. Asking for it
+still requires the session, so a redirect is only ever issued to a signed-in user
+— but note that once issued, the URL itself is unauthenticated until it expires.
+Swap `res.redirect` in `routes/mail.js` for a `fetch` and `pipe` if you would
+rather the bytes never leave your origin. The response is `Cache-Control:
+no-store` either way, since a cached redirect to an expired URL is a broken link.
+
+**Inline images are filtered out of the attachment list.** An attachment with
+`content_disposition: inline` *and* a `content_id` is a body part — a signature
+logo, an embedded screenshot — and bodies are fetched with `html_format:
+'data_uri'`, so it is already rendered inside the HTML. Listing it as a file too
+would show the same image twice and put a paperclip on mail that has no real
+attachment. `attachmentCount` counts the filtered list, so the badge agrees with
+what the reading pane shows. Inline parts *without* a Content-ID are nothing to
+do with the body and stay in the list.
 
 ### One caveat on `/mail/sent`
 
@@ -271,9 +296,7 @@ first — it names the problem directly. The deploy logs carry the same diagnosi
 
 ## Not included
 
-Scoped out of this version: downloading received attachments (their metadata is
-shown, and the signed-URL endpoints to fetch them exist —
-`resend.emails.receiving.attachments.get()`), attachments on drafts (see above),
+Scoped out of this version: attachments on drafts (see above),
 deleting sent or received mail (Resend
 has no delete API), server-side search (Resend's list endpoints don't support
 it), scheduled send, and conversation threading.
