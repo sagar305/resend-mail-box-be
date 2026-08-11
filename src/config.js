@@ -76,6 +76,50 @@ if (Math.ceil(attachments.maxTotalBytes / 3) * 4 > RESEND_MAX_ENCODED_BYTES) {
   );
 }
 
+function parsePositiveInt(value, fallback, name) {
+  if (value === undefined || value === '') return fallback;
+  const number = Number(value);
+  if (!Number.isInteger(number) || number < 1) {
+    throw new Error(`${name} must be a positive integer (got "${value}")`);
+  }
+  return number;
+}
+
+const scheduling = {
+  // Our own policy, not Resend's — nothing upstream enforces it, so it is counted
+  // in the ledger (services/scheduled.js). Counted per recipient: a bulk send to
+  // 50 people spends 50 of these.
+  maxPerDay: parsePositiveInt(process.env.MAX_SCHEDULED_PER_DAY, 60, 'MAX_SCHEDULED_PER_DAY'),
+  // Resend refuses a scheduled_at further out than this. Configurable because it
+  // is their number, not ours, and it has moved before (it was 72 hours once).
+  maxHorizonDays: parsePositiveInt(process.env.MAX_SCHEDULE_DAYS, 30, 'MAX_SCHEDULE_DAYS'),
+};
+
+const quota = {
+  // Resend has no endpoint that reports remaining quota, so the plan's daily
+  // allowance is configured here and reconciled against their sent log — see
+  // services/quota.js for why that reconciliation is cheap at this size.
+  dailyLimit: parsePositiveInt(process.env.RESEND_DAILY_QUOTA, 100, 'RESEND_DAILY_QUOTA'),
+};
+
+const bulk = {
+  // Resend's default rate limit is 2 requests/second per team. Sending is paced
+  // to stay under it rather than sprinting into a 429 and backing off.
+  sendsPerSecond: parsePositiveInt(process.env.RESEND_SENDS_PER_SECOND, 2, 'RESEND_SENDS_PER_SECOND'),
+  // A ceiling on one job, independent of the daily caps. Guards against a pasted
+  // spreadsheet of ten thousand rows becoming a job we then have to explain.
+  maxRecipients: parsePositiveInt(process.env.MAX_BULK_RECIPIENTS, 500, 'MAX_BULK_RECIPIENTS'),
+};
+
+if (scheduling.maxPerDay > quota.dailyLimit) {
+  // Not fatal: the scheduled cap is allowed to be the tighter of the two, but the
+  // reverse means the ledger would happily approve mail Resend will refuse.
+  console.warn(
+    `MAX_SCHEDULED_PER_DAY (${scheduling.maxPerDay}) is above RESEND_DAILY_QUOTA ` +
+    `(${quota.dailyLimit}). Scheduled mail can be accepted and then rejected by Resend.`,
+  );
+}
+
 export const config = {
   port: Number(process.env.PORT || 4000),
   corsOrigins,
@@ -104,6 +148,9 @@ export const config = {
   },
 
   attachments,
+  scheduling,
+  quota,
+  bulk,
   // The JSON body has to hold every attachment base64 encoded plus the HTML body,
   // so it is derived from the attachment budget rather than set independently —
   // otherwise raising one silently leaves the other as the real limit.

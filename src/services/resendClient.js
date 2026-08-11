@@ -195,7 +195,64 @@ export async function getAttachment(folder, emailId, attachmentId) {
   };
 }
 
-export async function sendMail({ to, cc, bcc, subject, html, text, attachments }) {
+/**
+ * Counts emails Resend logged since `since`, which is how the daily quota figure
+ * is made exact rather than inferred.
+ *
+ * Our own send count only sees what this app sent, so it is a lower bound — if
+ * the API key is used anywhere else, real usage is higher and a job we approved
+ * gets rejected mid-flight. Asking Resend closes that gap. It stays cheap because
+ * the page size matches the plan's daily allowance: at 100/day one call covers
+ * the whole window, and `maxPages` stops this from becoming an unbounded walk if
+ * the quota is ever raised well beyond that.
+ */
+export async function countSentSince(since, { maxPages = 5 } = {}) {
+  const cutoff = new Date(since).getTime();
+  let counted = 0;
+  let cursor;
+
+  for (let page = 0; page < maxPages; page += 1) {
+    const options = { limit: 100 };
+    if (cursor) options.after = cursor;
+
+    const result = unwrap(await resend.emails.list(options));
+    const emails = result.data || [];
+    if (!emails.length) return { count: counted, complete: true };
+
+    for (const email of emails) {
+      if (new Date(email.created_at).getTime() < cutoff) {
+        // The list is newest first, so the first email older than the window
+        // means every one after it is too.
+        return { count: counted, complete: true };
+      }
+      counted += 1;
+    }
+
+    if (!result.has_more) return { count: counted, complete: true };
+    cursor = emails[emails.length - 1]?.id;
+    if (!cursor) return { count: counted, complete: true };
+  }
+
+  // Ran out of pages with the window still open. The caller needs to know this
+  // is a floor, not a total, or it will block sends against a number that is low.
+  return { count: counted, complete: false };
+}
+
+/** Cancels a scheduled email. Terminal — Resend cannot revive a cancelled send. */
+export async function cancelScheduled(id) {
+  unwrap(await resend.emails.cancel(id));
+}
+
+/**
+ * Moves a scheduled email to a new time. This is an update rather than a
+ * cancel-and-resend because cancelling is irreversible: a failure halfway through
+ * a cancel/recreate pair would destroy the mail instead of moving it.
+ */
+export async function rescheduleEmail(id, scheduledAt) {
+  unwrap(await resend.emails.update({ id, scheduledAt }));
+}
+
+export async function sendMail({ to, cc, bcc, subject, html, text, attachments, scheduledAt }) {
   const payload = {
     from: config.mailboxAddress,
     to,
@@ -205,6 +262,9 @@ export async function sendMail({ to, cc, bcc, subject, html, text, attachments }
   };
   if (cc.length) payload.cc = cc;
   if (bcc.length) payload.bcc = bcc;
+  // Resend takes ISO 8601 here and treats it as an absolute instant; lib/schedule.js
+  // has already rejected anything without an explicit offset.
+  if (scheduledAt) payload.scheduledAt = scheduledAt;
   if (attachments?.length) {
     // Rebuilt field by field: our attachments carry validation leftovers Resend
     // has no use for, and `content` must be the bare base64 string.
