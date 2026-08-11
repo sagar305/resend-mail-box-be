@@ -45,18 +45,39 @@ function matches(doc, filter) {
   });
 }
 
+/** Reads `a.b.c` the way Mongo does, rather than as a literal key name. */
+function readPath(doc, path) {
+  return path.split('.').reduce((node, key) => (node == null ? undefined : node[key]), doc);
+}
+
+/** Writes `a.b.c`, creating the intermediate objects, and never mutating input. */
+function writePath(doc, path, value) {
+  const keys = path.split('.');
+  const last = keys.pop();
+  const root = { ...doc };
+  let node = root;
+  for (const key of keys) {
+    node[key] = { ...(node[key] ?? {}) };
+    node = node[key];
+  }
+  node[last] = value;
+  return root;
+}
+
 function applyUpdate(doc, update) {
-  const next = { ...doc };
+  let next = { ...doc };
   for (const [operator, fields] of Object.entries(update)) {
     switch (operator) {
       case '$set':
-        Object.assign(next, clone(fields));
+        for (const [field, value] of Object.entries(fields)) {
+          next = writePath(next, field, clone(value));
+        }
         break;
       case '$setOnInsert':
         break; // Only meaningful on insert; handled by the upsert path.
       case '$inc':
         for (const [field, amount] of Object.entries(fields)) {
-          next[field] = (next[field] ?? 0) + amount;
+          next = writePath(next, field, (readPath(next, field) ?? 0) + amount);
         }
         break;
       default:
@@ -168,7 +189,13 @@ class MemoryCollection {
   }
 
   async findOneAndUpdate(filter, update, options = {}) {
-    for (const doc of this.docs.values()) {
+    // The bulk sender claims recipients in order, so the sort has to be honoured
+    // here or the fake would hand them out in insertion order by luck alone.
+    const candidates = options.sort
+      ? sortDocs([...this.docs.values()], options.sort)
+      : [...this.docs.values()];
+
+    for (const doc of candidates) {
       if (matches(doc, filter)) {
         const updated = applyUpdate(doc, update);
         this.docs.set(doc._id, updated);

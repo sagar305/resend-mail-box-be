@@ -3,7 +3,19 @@ import { config } from '../config.js';
 import { ApiError } from '../lib/ApiError.js';
 import { attachmentLimits, parseAttachments } from '../lib/attachments.js';
 import { parseScheduledAt } from '../lib/schedule.js';
-import { assertSendable, normalizeComposePayload, parsePagination } from '../lib/validation.js';
+import {
+  assertSendable,
+  htmlToText,
+  normalizeComposePayload,
+  parseBulkRecipients,
+  parsePagination,
+} from '../lib/validation.js';
+import {
+  createBulkJob,
+  getBulkJob,
+  listBulkJobs,
+  retryFailedRecipients,
+} from '../services/bulkJobs.js';
 import { dailyQuota, noteSends } from '../services/quota.js';
 import {
   getAttachment,
@@ -117,6 +129,41 @@ mailRouter.patch('/scheduled/:id', asyncRoute(async (req, res) => {
     throw new ApiError(422, 'scheduledAt is required to reschedule', 'validation_error');
   }
   res.json({ message: await rescheduleMail(req.params.id, scheduledAt) });
+}));
+
+/*
+ * Bulk sends: one separate, personalized mail per recipient.
+ *
+ * Answers 202 with a job id rather than waiting — sixty recipients take about
+ * thirty seconds at Resend's rate limit, which no browser should sit through.
+ * Progress is polled from the job endpoints below.
+ */
+mailRouter.post('/bulk', asyncRoute(async (req, res) => {
+  const body = req.body ?? {};
+  const job = await createBulkJob({
+    subject: String(body.subject ?? '').trim(),
+    html: String(body.html ?? ''),
+    text: body.text ? String(body.text) : htmlToText(String(body.html ?? '')),
+    columns: Array.isArray(body.columns) ? body.columns.map((name) => String(name).trim()) : [],
+    recipients: parseBulkRecipients(body.recipients),
+    attachments: parseAttachments(body.attachments),
+    scheduledAt: parseScheduledAt(body.scheduledAt),
+  });
+  res.status(202).json({ job });
+}));
+
+mailRouter.get('/bulk', asyncRoute(async (_req, res) => {
+  res.json({ jobs: await listBulkJobs() });
+}));
+
+mailRouter.get('/bulk/:id', asyncRoute(async (req, res) => {
+  // The recipient rows are what make a partial failure legible, so the detail
+  // view always carries them.
+  res.json({ job: await getBulkJob(req.params.id, { withRecipients: true }) });
+}));
+
+mailRouter.post('/bulk/:id/retry', asyncRoute(async (req, res) => {
+  res.json({ job: await retryFailedRecipients(req.params.id) });
 }));
 
 mailRouter.post('/send', asyncRoute(async (req, res) => {

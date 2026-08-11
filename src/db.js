@@ -136,11 +136,20 @@ export async function connectDb() {
  * redeploy. This way /api/status can report the problem over HTTP and the app
  * recovers on its own once the database is reachable.
  */
-export function connectDbWithRetry({ intervalMs = 10_000 } = {}) {
+export function connectDbWithRetry({ intervalMs = 10_000, onConnected } = {}) {
   const attempt = async () => {
     try {
       await connectDb();
       console.log(`MongoDB connected (database: ${config.mongoDbName})`);
+      // Runs only on a real connection, and only once it exists — work that needs
+      // the database must not fire on the attempts that failed. Its own failures
+      // are contained here: the connection succeeded, and retrying it because a
+      // post-connect task threw would drop a database that is working.
+      try {
+        await onConnected?.();
+      } catch (hookError) {
+        console.error(`Post-connect task failed: ${hookError.message}`);
+      }
     } catch (error) {
       const hint = describeConnectionError(error);
       console.error('\nMongoDB connection failed. Serving 503s until it recovers.\n');

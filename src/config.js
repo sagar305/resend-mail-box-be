@@ -109,6 +109,10 @@ const bulk = {
   // A ceiling on one job, independent of the daily caps. Guards against a pasted
   // spreadsheet of ten thousand rows becoming a job we then have to explain.
   maxRecipients: parsePositiveInt(process.env.MAX_BULK_RECIPIENTS, 500, 'MAX_BULK_RECIPIENTS'),
+  // How long to wait out a 429 before re-offering the same recipient.
+  rateLimitBackoffMs: parsePositiveInt(
+    process.env.RATE_LIMIT_BACKOFF_MS, 5_000, 'RATE_LIMIT_BACKOFF_MS',
+  ),
 };
 
 if (scheduling.maxPerDay > quota.dailyLimit) {
