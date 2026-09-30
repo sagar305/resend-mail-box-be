@@ -2,7 +2,7 @@ import { Router } from 'express';
 import { config } from '../config.js';
 import { ApiError } from '../lib/ApiError.js';
 import { attachmentLimits, parseAttachments } from '../lib/attachments.js';
-import { parseScheduledAt } from '../lib/schedule.js';
+import { parseDayParam, parseScheduledAt } from '../lib/schedule.js';
 import {
   assertSendable,
   htmlToText,
@@ -89,14 +89,20 @@ mailRouter.get('/sent/:id', asyncRoute(async (req, res) => {
 
 /**
  * Everything the compose form needs to stop a send it already knows will fail:
- * the attachment numbers this API enforces, how many scheduled slots the day has
+ * the attachment numbers this API enforces, how many scheduled slots a day has
  * left, and how much of the Resend plan's allowance is gone.
+ *
+ * `?day=YYYY-MM-DD` asks about that delivery day rather than today, because that
+ * is the day a schedule spends its slots on. Without it the picker would quote
+ * today's remainder while reserving another day's, and promise slots that are
+ * not there.
  *
  * The quota figure is read from cache here. It is the meter, not the gate — the
  * gate re-reads it fresh at the moment mail would actually go out.
  */
-mailRouter.get('/limits', asyncRoute(async (_req, res) => {
-  const [slots, quota] = await Promise.all([slotUsage(), dailyQuota()]);
+mailRouter.get('/limits', asyncRoute(async (req, res) => {
+  const day = parseDayParam(req.query.day);
+  const [slots, quota] = await Promise.all([slotUsage(day), dailyQuota()]);
   res.json({
     attachments: attachmentLimits(),
     scheduling: {

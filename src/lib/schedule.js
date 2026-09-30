@@ -34,6 +34,29 @@ export function nextUtcMidnight(now = new Date()) {
 }
 
 /**
+ * Validates a `YYYY-MM-DD` day from a query string.
+ *
+ * The caps are counted per delivery day, so every screen that shows a remaining
+ * count has to ask about the day the mail is actually going out — not today.
+ * Showing today's number while reserving another day's is how a picker promises
+ * sixty free slots and then refuses the send.
+ */
+export function parseDayParam(value, fallback = new Date()) {
+  if (value === undefined || value === null || value === '') return utcDay(fallback);
+
+  const text = String(value).trim();
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(text)) {
+    throw new ApiError(422, `day must look like YYYY-MM-DD (got "${text}")`, 'validation_error');
+  }
+  // Catches the shapes the pattern lets through, like 2026-02-31.
+  const parsed = new Date(`${text}T00:00:00.000Z`);
+  if (Number.isNaN(parsed.getTime()) || utcDay(parsed) !== text) {
+    throw new ApiError(422, `day is not a real date: "${text}"`, 'validation_error');
+  }
+  return text;
+}
+
+/**
  * Validates a client-supplied schedule time and returns it normalized.
  *
  * Resend accepts ISO 8601 for single sends (natural language is a broadcasts
