@@ -78,6 +78,53 @@ export function normalizeComposePayload(body) {
   };
 }
 
+/**
+ * Normalizes the bulk composer's recipient table.
+ *
+ * Each row is one separate mail, so a duplicated address means someone gets the
+ * same thing twice — dropped rather than sent, keeping the first occurrence so
+ * the merge values a person expects are the ones nearest the top of their list.
+ */
+export function parseBulkRecipients(value) {
+  if (!Array.isArray(value)) {
+    throw new ApiError(422, 'recipients must be an array of rows', 'validation_error');
+  }
+
+  const seen = new Set();
+  const recipients = [];
+
+  value.forEach((row, index) => {
+    if (!row || typeof row !== 'object') {
+      throw new ApiError(422, `Row ${index + 1} is not a recipient`, 'validation_error');
+    }
+    const email = String(row.email ?? '').trim();
+    if (!email) {
+      throw new ApiError(422, `Row ${index + 1} has no email address`, 'validation_error');
+    }
+    if (!EMAIL_PATTERN.test(email)) {
+      throw new ApiError(422, `Row ${index + 1} has an invalid address: ${email}`, 'validation_error');
+    }
+
+    const key = email.toLowerCase();
+    if (seen.has(key)) return;
+    seen.add(key);
+
+    // Values are kept as trimmed strings: they are pasted from a spreadsheet and
+    // land in a subject line, where a stray newline or number type helps nobody.
+    const vars = {};
+    for (const [column, columnValue] of Object.entries(row.vars ?? {})) {
+      vars[String(column).trim()] = String(columnValue ?? '').trim();
+    }
+
+    recipients.push({ email, vars });
+  });
+
+  if (!recipients.length) {
+    throw new ApiError(422, 'A bulk send needs at least one recipient', 'validation_error');
+  }
+  return recipients;
+}
+
 /** Extra checks that only apply when actually sending (drafts may be blank). */
 export function assertSendable(payload) {
   if (!payload.to.length) {

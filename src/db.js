@@ -1,4 +1,4 @@
-import { MongoClient } from 'mongodb';
+import { GridFSBucket, MongoClient } from 'mongodb';
 import { config } from './config.js';
 import { ApiError } from './lib/ApiError.js';
 
@@ -36,7 +36,30 @@ export function getCollections() {
   return {
     drafts: database.collection('drafts'),
     readReceipts: database.collection('readReceipts'),
+    // One document per scheduled email, keyed by the Resend id.
+    scheduled: database.collection('scheduled'),
+    // One document per UTC day holding the reserved-slot count. Separate from
+    // `scheduled` so a slot can be claimed atomically before the send is made.
+    scheduleCounters: database.collection('scheduleCounters'),
+    bulkJobs: database.collection('bulkJobs'),
+    bulkRecipients: database.collection('bulkRecipients'),
   };
+}
+
+/**
+ * Where a bulk job's attachments live while it runs.
+ *
+ * They cannot ride along in the job document: 20 MB of files is ~27 MB base64
+ * encoded, against Mongo's 16 MB per-document ceiling — the same wall the drafts
+ * feature hits, which is why a draft is saved without its attachments. GridFS
+ * chunks them instead, so a job interrupted by a redeploy still has its files
+ * when it resumes.
+ */
+export function getAttachmentBucket() {
+  if (!database) {
+    throw new ApiError(503, 'Database unavailable. See GET /api/status.', 'database_unavailable');
+  }
+  return new GridFSBucket(database, { bucketName: 'bulkAttachments' });
 }
 
 /**
@@ -84,8 +107,16 @@ export async function connectDb() {
     await client.connect();
     useDatabase(client.db(config.mongoDbName));
 
+    const { drafts, scheduled, bulkJobs, bulkRecipients } = getCollections();
     // Drafts are always listed most-recently-edited first.
-    await getCollections().drafts.createIndex({ updatedAt: -1 });
+    await drafts.createIndex({ updatedAt: -1 });
+    // The Scheduled folder lists what is due soonest first, and the ledger counts
+    // by day, so both fields carry an index.
+    await scheduled.createIndex({ scheduledAt: 1 });
+    await scheduled.createIndex({ day: 1, status: 1 });
+    await bulkJobs.createIndex({ createdAt: -1 });
+    // The sender claims work with findOneAndUpdate on exactly this pair.
+    await bulkRecipients.createIndex({ jobId: 1, status: 1 });
 
     return database;
   } catch (error) {
@@ -105,11 +136,20 @@ export async function connectDb() {
  * redeploy. This way /api/status can report the problem over HTTP and the app
  * recovers on its own once the database is reachable.
  */
-export function connectDbWithRetry({ intervalMs = 10_000 } = {}) {
+export function connectDbWithRetry({ intervalMs = 10_000, onConnected } = {}) {
   const attempt = async () => {
     try {
       await connectDb();
       console.log(`MongoDB connected (database: ${config.mongoDbName})`);
+      // Runs only on a real connection, and only once it exists — work that needs
+      // the database must not fire on the attempts that failed. Its own failures
+      // are contained here: the connection succeeded, and retrying it because a
+      // post-connect task threw would drop a database that is working.
+      try {
+        await onConnected?.();
+      } catch (hookError) {
+        console.error(`Post-connect task failed: ${hookError.message}`);
+      }
     } catch (error) {
       const hint = describeConnectionError(error);
       console.error('\nMongoDB connection failed. Serving 503s until it recovers.\n');
