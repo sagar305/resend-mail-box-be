@@ -1,7 +1,6 @@
 import { getCollections } from '../db.js';
 import { ApiError } from '../lib/ApiError.js';
 import { utcDay } from '../lib/schedule.js';
-import { noteSends } from './quota.js';
 import { cancelScheduled, rescheduleEmail, sendMail } from './resendClient.js';
 import { releaseSlots, reserveSlots } from './slots.js';
 
@@ -79,7 +78,6 @@ export async function scheduleMail(payload) {
     jobId: payload.jobId ?? null,
   };
   await scheduled.insertOne(doc);
-  noteSends(1);
 
   return { scheduled: toScheduled(doc), usage };
 }

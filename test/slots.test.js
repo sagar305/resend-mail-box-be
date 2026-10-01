@@ -4,12 +4,16 @@ import assert from 'node:assert/strict';
 import { beforeEach, describe, it } from 'node:test';
 
 import { useDatabase } from '../src/db.js';
+import { config } from '../src/config.js';
 import { ApiError } from '../src/lib/ApiError.js';
 import { releaseSlots, reserveSlots, slotUsage } from '../src/services/slots.js';
 import { createMemoryDb } from './helpers/memoryDb.js';
 
 const DAY = '2026-08-11';
-const LIMIT = 60;
+// Read rather than hardcoded: the cap derives from the quota minus the reserve,
+// so a literal here would turn a deliberate config change into a test failure
+// that says nothing about whether the ledger still works.
+const LIMIT = config.scheduling.maxPerDay;
 
 const db = createMemoryDb();
 
@@ -68,11 +72,11 @@ describe('reserveSlots', () => {
   });
 
   it('refuses a bulk claim that does not fit, rather than partly filling it', async () => {
-    await reserveSlots(DAY, 50);
-    // 20 more will not fit in the remaining 10. Taking 10 and abandoning 10
+    await reserveSlots(DAY, LIMIT - 10);
+    // Twenty will not fit in the remaining ten. Taking ten and abandoning ten
     // recipients is the outcome this all-or-nothing rule exists to prevent.
-    await assert.rejects(() => reserveSlots(DAY, 20), /Only 10 of the 60/);
-    assert.equal((await slotUsage(DAY)).used, 50, 'a refused claim must spend nothing');
+    await assert.rejects(() => reserveSlots(DAY, 20), /Only 10 of the/);
+    assert.equal((await slotUsage(DAY)).used, LIMIT - 10, 'a refused claim must spend nothing');
   });
 
   it('refuses a claim larger than a day could ever hold', async () => {
@@ -98,15 +102,16 @@ describe('reserveSlots', () => {
   });
 
   it('never oversells when concurrent claims are for different sizes', async () => {
-    const attempts = [
-      reserveSlots(DAY, 25),
-      reserveSlots(DAY, 25),
-      reserveSlots(DAY, 25),
-    ];
-    const results = await Promise.allSettled(attempts);
+    // Each claim is just over half the day, so exactly two can fit however they
+    // interleave and the third must be refused.
+    const size = Math.floor(LIMIT / 2);
+    const results = await Promise.allSettled([
+      reserveSlots(DAY, size),
+      reserveSlots(DAY, size),
+      reserveSlots(DAY, size),
+    ]);
     const granted = results.filter((result) => result.status === 'fulfilled');
 
-    // Two fit, the third cannot. Whichever loses, the total must stay within 60.
     assert.equal(granted.length, 2);
     assert.ok((await slotUsage(DAY)).used <= LIMIT);
   });

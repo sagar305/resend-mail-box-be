@@ -5,7 +5,7 @@ import { ApiError } from '../lib/ApiError.js';
 import { assertRecipientsResolvable, extractTokens, renderForRecipient } from '../lib/merge.js';
 import { utcDay } from '../lib/schedule.js';
 import { discardAttachments, loadAttachments, stageAttachments } from './bulkAttachments.js';
-import { assertQuotaFor, noteSends } from './quota.js';
+import { assertImmediateQuota, noteImmediateSends } from './quota.js';
 import { sendMail } from './resendClient.js';
 import { releaseSlots, reserveSlots } from './slots.js';
 
@@ -122,14 +122,22 @@ export async function createBulkJob({
   const tokens = extractTokens(subject, html, text);
   assertRecipientsResolvable(recipients, tokens);
 
-  // Every recipient is a separate send, so the job costs one Resend email each
-  // way. This is checked for scheduled jobs too: the API calls are made now, and
-  // whether Resend bills the quota at call time or delivery time is not
-  // documented, so the conservative reading is the safe one.
-  await assertQuotaFor(recipients.length);
-
+  /*
+   * Which allowance this spends depends on when it goes out.
+   *
+   * A scheduled job charges its DELIVERY day, and the slot ledger is what holds
+   * that date inside the quota — so laying out a week's mail over a weekend is
+   * limited by each weekday's own budget, not by the weekend day it was booked on.
+   *
+   * An immediate job charges today, and may spend the reserve, since ad-hoc mail
+   * is exactly what the reserve is held back for.
+   */
   const day = scheduledAt ? utcDay(scheduledAt) : null;
-  if (day) await reserveSlots(day, recipients.length);
+  if (day) {
+    await reserveSlots(day, recipients.length);
+  } else {
+    await assertImmediateQuota(recipients.length);
+  }
 
   const jobId = randomUUID();
   let staged = [];
@@ -257,7 +265,9 @@ export async function runJob(jobId) {
           $set: { updatedAt: new Date().toISOString() },
         },
       );
-      if (outcome.sent) noteSends(1);
+      // Only immediate sends are tallied here; a scheduled one was counted by
+      // the ledger when its slot was reserved.
+      if (outcome.sent && !job.scheduledAt) noteImmediateSends(1);
 
       // Pace the next send. Time already spent on this one counts toward the gap.
       const elapsed = Date.now() - startedAt;
@@ -369,8 +379,13 @@ export async function retryFailedRecipients(jobId) {
     throw new ApiError(409, 'Nothing in this send is waiting to be retried', 'invalid_state');
   }
 
-  await assertQuotaFor(outstanding);
-  if (job.day) await reserveSlots(job.day, outstanding);
+  // Same split as the original send: a scheduled job's retry re-books its
+  // delivery day, an immediate one spends what is left of today.
+  if (job.day) {
+    await reserveSlots(job.day, outstanding);
+  } else {
+    await assertImmediateQuota(outstanding);
+  }
 
   await bulkRecipients.updateMany(
     { jobId, status: 'failed' },

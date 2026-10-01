@@ -16,7 +16,7 @@ import {
   listBulkJobs,
   retryFailedRecipients,
 } from '../services/bulkJobs.js';
-import { dailyQuota, noteSends } from '../services/quota.js';
+import { assertImmediateQuota, dailyQuota, noteImmediateSends } from '../services/quota.js';
 import {
   getAttachment,
   getReceived,
@@ -90,19 +90,19 @@ mailRouter.get('/sent/:id', asyncRoute(async (req, res) => {
 /**
  * Everything the compose form needs to stop a send it already knows will fail:
  * the attachment numbers this API enforces, how many scheduled slots a day has
- * left, and how much of the Resend plan's allowance is gone.
+ * left, and how much of that day's Resend allowance is committed.
  *
- * `?day=YYYY-MM-DD` asks about that delivery day rather than today, because that
- * is the day a schedule spends its slots on. Without it the picker would quote
- * today's remainder while reserving another day's, and promise slots that are
- * not there.
+ * `?day=YYYY-MM-DD` asks about that delivery day rather than today, because a
+ * schedule spends its slots on the day it goes out. Without it the picker would
+ * quote today's remainder while reserving another day's, and promise slots that
+ * are not there.
  *
  * The quota figure is read from cache here. It is the meter, not the gate — the
  * gate re-reads it fresh at the moment mail would actually go out.
  */
 mailRouter.get('/limits', asyncRoute(async (req, res) => {
   const day = parseDayParam(req.query.day);
-  const [slots, quota] = await Promise.all([slotUsage(day), dailyQuota()]);
+  const [slots, quota] = await Promise.all([slotUsage(day), dailyQuota({ day })]);
   res.json({
     attachments: attachmentLimits(),
     scheduling: {
@@ -181,16 +181,17 @@ mailRouter.post('/send', asyncRoute(async (req, res) => {
   };
   assertSendable(payload);
 
-  // A scheduled send spends a slot from the daily ledger and is recorded so the
-  // Scheduled folder and the cap both know about it. An immediate send is
-  // uncapped and goes straight out, exactly as it did before.
+  // A scheduled send spends a slot on its DELIVERY day and is recorded so the
+  // Scheduled folder and that day's budget both know about it. An immediate send
+  // spends today's allowance, reserve included, and goes straight out.
   if (payload.scheduledAt) {
     const { scheduled, usage } = await scheduleMail(payload);
     res.status(202).json({ id: scheduled.id, scheduledAt: scheduled.scheduledAt, usage });
     return;
   }
 
+  await assertImmediateQuota(1);
   const { id } = await sendMail(payload);
-  noteSends(1);
+  noteImmediateSends(1);
   res.status(202).json({ id });
 }));
