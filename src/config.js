@@ -85,22 +85,59 @@ function parsePositiveInt(value, fallback, name) {
   return number;
 }
 
+const quota = {
+  // Resend has no endpoint that reports remaining quota, so the plan's daily
+  // allowance is configured here. Confirmed to be a UTC calendar day, which is
+  // why every window in this app is UTC.
+  dailyLimit: parsePositiveInt(process.env.RESEND_DAILY_QUOTA, 100, 'RESEND_DAILY_QUOTA'),
+  /*
+   * Held back from scheduling, never bookable in advance.
+   *
+   * A date's allowance is shared by three things: mail scheduled for it, mail
+   * sent by hand on the day, and mail that arrives — received email counts
+   * against the quota too, one apiece. Letting schedules claim the whole hundred
+   * would mean a fully booked date silently rejects your inbox.
+   */
+  reserve: parsePositiveInt(process.env.RESEND_DAILY_RESERVE, 20, 'RESEND_DAILY_RESERVE'),
+};
+
+if (quota.reserve >= quota.dailyLimit) {
+  throw new Error(
+    `RESEND_DAILY_RESERVE (${quota.reserve}) must be below RESEND_DAILY_QUOTA ` +
+    `(${quota.dailyLimit}), or nothing could ever be scheduled.`,
+  );
+}
+
+/*
+ * How much of a date may be booked in advance.
+ *
+ * Derived from the quota rather than set beside it: the cap exists to keep a
+ * date's schedules inside what Resend will actually deliver that day, so two
+ * independent numbers would just be a way for them to disagree. An explicit
+ * MAX_SCHEDULED_PER_DAY may lower it but never raise it past the reserve.
+ */
+const schedulablePerDay = quota.dailyLimit - quota.reserve;
+const configuredPerDay = process.env.MAX_SCHEDULED_PER_DAY === undefined
+  || process.env.MAX_SCHEDULED_PER_DAY === ''
+  ? schedulablePerDay
+  : parsePositiveInt(process.env.MAX_SCHEDULED_PER_DAY, schedulablePerDay, 'MAX_SCHEDULED_PER_DAY');
+
 const scheduling = {
-  // Our own policy, not Resend's — nothing upstream enforces it, so it is counted
-  // in the ledger (services/scheduled.js). Counted per recipient: a bulk send to
-  // 50 people spends 50 of these.
-  maxPerDay: parsePositiveInt(process.env.MAX_SCHEDULED_PER_DAY, 60, 'MAX_SCHEDULED_PER_DAY'),
+  // Counted per DELIVERY day and per recipient: fifty mails scheduled for Monday
+  // spend fifty of Monday's slots, whichever day they were scheduled on. That is
+  // what makes it possible to lay out a week's mail over a weekend.
+  maxPerDay: Math.min(configuredPerDay, schedulablePerDay),
   // Resend refuses a scheduled_at further out than this. Configurable because it
   // is their number, not ours, and it has moved before (it was 72 hours once).
   maxHorizonDays: parsePositiveInt(process.env.MAX_SCHEDULE_DAYS, 30, 'MAX_SCHEDULE_DAYS'),
 };
 
-const quota = {
-  // Resend has no endpoint that reports remaining quota, so the plan's daily
-  // allowance is configured here and reconciled against their sent log — see
-  // services/quota.js for why that reconciliation is cheap at this size.
-  dailyLimit: parsePositiveInt(process.env.RESEND_DAILY_QUOTA, 100, 'RESEND_DAILY_QUOTA'),
-};
+if (configuredPerDay > schedulablePerDay) {
+  console.warn(
+    `MAX_SCHEDULED_PER_DAY (${configuredPerDay}) is above what the daily quota leaves ` +
+    `after the reserve (${schedulablePerDay}). Using ${schedulablePerDay}.`,
+  );
+}
 
 const bulk = {
   // Resend's default rate limit is 2 requests/second per team. Sending is paced
@@ -115,14 +152,8 @@ const bulk = {
   ),
 };
 
-if (scheduling.maxPerDay > quota.dailyLimit) {
-  // Not fatal: the scheduled cap is allowed to be the tighter of the two, but the
-  // reverse means the ledger would happily approve mail Resend will refuse.
-  console.warn(
-    `MAX_SCHEDULED_PER_DAY (${scheduling.maxPerDay}) is above RESEND_DAILY_QUOTA ` +
-    `(${quota.dailyLimit}). Scheduled mail can be accepted and then rejected by Resend.`,
-  );
-}
+// The cap is now derived from the quota, so the two cannot disagree by
+// construction — the clamp above is what guarantees it.
 
 export const config = {
   port: Number(process.env.PORT || 4000),

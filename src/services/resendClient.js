@@ -196,17 +196,22 @@ export async function getAttachment(folder, emailId, attachmentId) {
 }
 
 /**
- * Counts emails Resend logged since `since`, which is how the daily quota figure
- * is made exact rather than inferred.
+ * Counts mail Resend logged since `since` that was sent immediately — anything
+ * carrying a `scheduled_at` is skipped.
  *
- * Our own send count only sees what this app sent, so it is a lower bound — if
- * the API key is used anywhere else, real usage is higher and a job we approved
- * gets rejected mid-flight. Asking Resend closes that gap. It stays cheap because
- * the page size matches the plan's daily allowance: at 100/day one call covers
- * the whole window, and `maxPages` stops this from becoming an unbounded walk if
- * the quota is ever raised well beyond that.
+ * The exclusion is the important part. Quota is now accounted per DELIVERY day,
+ * and Resend's log stamps `created_at` with the moment of the API call, so a mail
+ * scheduled on Saturday for Monday appears in Saturday's log. Counting it there
+ * would charge it to the wrong day, and counting it at all would double it: the
+ * ledger already holds every schedule, keyed by the day it goes out. So the log
+ * answers for immediate sends and the ledger answers for scheduled ones, with
+ * nothing belonging to both.
+ *
+ * It stays cheap because the page size matches the plan's daily allowance: at
+ * 100/day one call covers the window, and `maxPages` stops this from becoming an
+ * unbounded walk if the quota is ever raised well beyond that.
  */
-export async function countSentSince(since, { maxPages = 5 } = {}) {
+export async function countImmediateSentSince(since, { maxPages = 5 } = {}) {
   const cutoff = new Date(since).getTime();
   let counted = 0;
   let cursor;
@@ -225,7 +230,7 @@ export async function countSentSince(since, { maxPages = 5 } = {}) {
         // means every one after it is too.
         return { count: counted, complete: true };
       }
-      counted += 1;
+      if (!email.scheduled_at) counted += 1;
     }
 
     if (!result.has_more) return { count: counted, complete: true };
@@ -252,7 +257,7 @@ export async function rescheduleEmail(id, scheduledAt) {
   unwrap(await resend.emails.update({ id, scheduledAt }));
 }
 
-export async function sendMail({ to, cc, bcc, subject, html, text, attachments, scheduledAt }) {
+async function sendViaResend({ to, cc, bcc, subject, html, text, attachments, scheduledAt }) {
   const payload = {
     from: config.mailboxAddress,
     to,
@@ -277,4 +282,23 @@ export async function sendMail({ to, cc, bcc, subject, html, text, attachments, 
 
   const result = unwrap(await resend.emails.send(payload));
   return { id: result.id };
+}
+
+/**
+ * The single seam for putting a mail on the wire.
+ *
+ * Everything that sends — a plain compose, the daily hand-over, each recipient of
+ * a bulk job — goes through here, so a test can stand in for Resend once and
+ * exercise the logic around it: pacing, retries, the daily dispatch, slot
+ * accounting. That logic is the part worth testing and the part hardest to reach
+ * otherwise.
+ */
+let mailSender = sendViaResend;
+
+export function setMailSender(fn) {
+  mailSender = fn ?? sendViaResend;
+}
+
+export function sendMail(payload) {
+  return mailSender(payload);
 }

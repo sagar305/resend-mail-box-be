@@ -4,8 +4,8 @@ import { getCollections } from '../db.js';
 import { ApiError } from '../lib/ApiError.js';
 import { assertRecipientsResolvable, extractTokens, renderForRecipient } from '../lib/merge.js';
 import { utcDay } from '../lib/schedule.js';
-import { discardAttachments, loadAttachments, stageAttachments } from './bulkAttachments.js';
-import { assertQuotaFor, noteSends } from './quota.js';
+import { discardAttachments, loadAttachments, stageAttachments } from './attachmentStore.js';
+import { assertImmediateQuota, noteImmediateSends } from './quota.js';
 import { sendMail } from './resendClient.js';
 import { releaseSlots, reserveSlots } from './slots.js';
 
@@ -45,16 +45,6 @@ export function stopBulkSending() {
   stopping = true;
 }
 
-/**
- * The function used to put one mail on the wire. Swappable so the loop's own
- * behaviour — pacing, claiming, retrying, halting — can be tested without
- * reaching Resend, which is the part of this file most worth testing and the
- * part hardest to reach otherwise.
- */
-let sender = sendMail;
-export function setBulkSender(fn) {
-  sender = fn ?? sendMail;
-}
 
 function toJob(doc, recipients) {
   return {
@@ -122,14 +112,27 @@ export async function createBulkJob({
   const tokens = extractTokens(subject, html, text);
   assertRecipientsResolvable(recipients, tokens);
 
-  // Every recipient is a separate send, so the job costs one Resend email each
-  // way. This is checked for scheduled jobs too: the API calls are made now, and
-  // whether Resend bills the quota at call time or delivery time is not
-  // documented, so the conservative reading is the safe one.
-  await assertQuotaFor(recipients.length);
-
+  /*
+   * Which allowance this spends depends on when it goes out.
+   *
+   * A scheduled job charges its DELIVERY day, and the slot ledger is what holds
+   * that date inside the quota — so laying out a week's mail over a weekend is
+   * limited by each weekday's own budget, not by the weekend day it was booked on.
+   *
+   * An immediate job charges today, and may spend the reserve, since ad-hoc mail
+   * is exactly what the reserve is held back for.
+   */
   const day = scheduledAt ? utcDay(scheduledAt) : null;
-  if (day) await reserveSlots(day, recipients.length);
+  if (day) {
+    await reserveSlots(day, recipients.length);
+  } else {
+    await assertImmediateQuota(recipients.length);
+  }
+
+  // Parked only if its day is still ahead. A job scheduled for later today has
+  // already missed this morning's dispatch, and today is its right quota day
+  // anyway, so it runs now and Resend holds each mail until its time.
+  const parked = Boolean(day) && day > utcDay(new Date());
 
   const jobId = randomUUID();
   let staged = [];
@@ -141,7 +144,10 @@ export async function createBulkJob({
 
     await bulkJobs.insertOne({
       _id: jobId,
-      status: 'running',
+      // A scheduled job is parked until its delivery day, so its sends land in
+      // that day's Resend quota rather than in whichever day it was created.
+      // The dispatcher releases it; anything due today runs now.
+      status: parked ? 'pending' : 'running',
       subject,
       html,
       text,
@@ -174,12 +180,37 @@ export async function createBulkJob({
     throw error;
   }
 
-  // Deliberately not awaited: the caller gets its job id straight away and polls.
+  // A job due today starts now, deliberately not awaited so the caller gets its
+  // job id straight away and polls. A parked one waits for the dispatcher.
+  if (!parked) {
+    runJob(jobId).catch((error) => {
+      console.error(`Bulk job ${jobId} failed: ${error.message}`);
+    });
+  }
+
+  return getBulkJob(jobId);
+}
+
+/**
+ * Releases a parked job on its delivery day. Called by the dispatcher.
+ *
+ * Its slots were claimed when it was created, so there is nothing to re-check
+ * here — only the sends themselves are still to happen.
+ */
+export async function startBulkJob(jobId) {
+  const { bulkJobs } = getCollections();
+  const claimed = await bulkJobs.findOneAndUpdate(
+    // Conditional on still being pending, so two dispatch sweeps overlapping
+    // cannot start the same job twice.
+    { _id: jobId, status: 'pending' },
+    { $set: { status: 'running', updatedAt: new Date().toISOString() } },
+  );
+  if (!claimed) return false;
+
   runJob(jobId).catch((error) => {
     console.error(`Bulk job ${jobId} failed: ${error.message}`);
   });
-
-  return getBulkJob(jobId);
+  return true;
 }
 
 /**
@@ -257,7 +288,9 @@ export async function runJob(jobId) {
           $set: { updatedAt: new Date().toISOString() },
         },
       );
-      if (outcome.sent) noteSends(1);
+      // Only immediate sends are tallied here; a scheduled one was counted by
+      // the ledger when its slot was reserved.
+      if (outcome.sent && !job.scheduledAt) noteImmediateSends(1);
 
       // Pace the next send. Time already spent on this one counts toward the gap.
       const elapsed = Date.now() - startedAt;
@@ -275,7 +308,7 @@ async function sendToRecipient(job, recipient, files) {
   const rendered = renderForRecipient(job, recipient.vars);
 
   try {
-    const { id } = await sender({
+    const { id } = await sendMail({
       to: [recipient.email],
       // A bulk send never carries cc or bcc: copying a fixed address onto every
       // one of these mails would leak the list and defeat the whole feature.
@@ -369,8 +402,13 @@ export async function retryFailedRecipients(jobId) {
     throw new ApiError(409, 'Nothing in this send is waiting to be retried', 'invalid_state');
   }
 
-  await assertQuotaFor(outstanding);
-  if (job.day) await reserveSlots(job.day, outstanding);
+  // Same split as the original send: a scheduled job's retry re-books its
+  // delivery day, an immediate one spends what is left of today.
+  if (job.day) {
+    await reserveSlots(job.day, outstanding);
+  } else {
+    await assertImmediateQuota(outstanding);
+  }
 
   await bulkRecipients.updateMany(
     { jobId, status: 'failed' },

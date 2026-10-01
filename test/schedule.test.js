@@ -4,7 +4,13 @@ import assert from 'node:assert/strict';
 import { describe, it } from 'node:test';
 
 import { ApiError } from '../src/lib/ApiError.js';
-import { nextUtcMidnight, parseScheduledAt, startOfUtcDay, utcDay } from '../src/lib/schedule.js';
+import {
+  nextUtcMidnight,
+  parseDayParam,
+  parseScheduledAt,
+  startOfUtcDay,
+  utcDay,
+} from '../src/lib/schedule.js';
 
 const NOW = new Date('2026-08-11T12:00:00.000Z');
 
@@ -31,6 +37,35 @@ describe('startOfUtcDay / nextUtcMidnight', () => {
     const midnight = new Date('2026-08-11T00:00:00.000Z');
     assert.equal(startOfUtcDay(midnight).toISOString(), '2026-08-11T00:00:00.000Z');
     assert.equal(nextUtcMidnight(midnight).toISOString(), '2026-08-12T00:00:00.000Z');
+  });
+});
+
+describe('parseDayParam', () => {
+  it('falls back to today when no day is asked for', () => {
+    assert.equal(parseDayParam(undefined, NOW), '2026-08-11');
+    assert.equal(parseDayParam('', NOW), '2026-08-11');
+  });
+
+  it('accepts a real day', () => {
+    // The point of the parameter: the picker asks about the day it is pointing
+    // at, not today, because slots belong to the delivery day.
+    assert.equal(parseDayParam('2026-09-05', NOW), '2026-09-05');
+  });
+
+  it('rejects a malformed day', () => {
+    assert.throws(
+      () => parseDayParam('05-09-2026', NOW),
+      (error) => error instanceof ApiError && error.status === 422,
+    );
+  });
+
+  it('rejects a day that looks right but does not exist', () => {
+    // Date would roll 2026-02-31 forward to March, quietly answering about a
+    // different day than the one that was asked for.
+    assert.throws(
+      () => parseDayParam('2026-02-31', NOW),
+      (error) => error instanceof ApiError && /not a real date/.test(error.message),
+    );
   });
 });
 

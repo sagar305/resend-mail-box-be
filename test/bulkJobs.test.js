@@ -9,8 +9,8 @@ import {
   getBulkJob,
   resumeInterruptedJobs,
   runJob,
-  setBulkSender,
 } from '../src/services/bulkJobs.js';
+import { setMailSender } from '../src/services/resendClient.js';
 import { reserveSlots, slotUsage } from '../src/services/slots.js';
 import { createMemoryDb } from './helpers/memoryDb.js';
 
@@ -65,13 +65,13 @@ const rows = (count) => Array.from({ length: count }, (_unused, index) => ({
 beforeEach(() => {
   db.reset();
   useDatabase(db);
-  setBulkSender(async () => ({ id: `resend-${Math.random()}` }));
+  setMailSender(async () => ({ id: `resend-${Math.random()}` }));
 });
 
 describe('runJob', () => {
   it('sends one separate mail per recipient', async () => {
     const sent = [];
-    setBulkSender(async (payload) => {
+    setMailSender(async (payload) => {
       sent.push(payload);
       return { id: `resend-${sent.length}` };
     });
@@ -90,7 +90,7 @@ describe('runJob', () => {
 
   it('never puts a cc or bcc on a bulk mail', async () => {
     const sent = [];
-    setBulkSender(async (payload) => {
+    setMailSender(async (payload) => {
       sent.push(payload);
       return { id: 'resend-1' };
     });
@@ -105,7 +105,7 @@ describe('runJob', () => {
 
   it('personalizes each mail from that row', async () => {
     const sent = [];
-    setBulkSender(async (payload) => {
+    setMailSender(async (payload) => {
       sent.push(payload);
       return { id: 'resend-1' };
     });
@@ -134,7 +134,7 @@ describe('runJob', () => {
   });
 
   it('records a per-recipient failure without abandoning the rest', async () => {
-    setBulkSender(async ({ to }) => {
+    setMailSender(async ({ to }) => {
       if (to[0] === 'person1@example.test') throw new ApiError(422, 'Invalid recipient');
       return { id: 'resend-ok' };
     });
@@ -154,7 +154,7 @@ describe('runJob', () => {
 
   it('stops the job when Resend reports the daily quota is gone', async () => {
     let calls = 0;
-    setBulkSender(async () => {
+    setMailSender(async () => {
       calls += 1;
       if (calls > 2) throw new ApiError(429, 'Daily quota reached', 'daily_quota_exceeded');
       return { id: `resend-${calls}` };
@@ -175,7 +175,7 @@ describe('runJob', () => {
 
   it('retries a rate-limited recipient rather than failing them', async () => {
     let attempts = 0;
-    setBulkSender(async () => {
+    setMailSender(async () => {
       attempts += 1;
       if (attempts === 1) throw new ApiError(429, 'Too many requests', 'rate_limit_exceeded');
       return { id: 'resend-ok' };
@@ -191,7 +191,7 @@ describe('runJob', () => {
   });
 
   it('gives back the scheduled slots of recipients that failed', async () => {
-    setBulkSender(async ({ to }) => {
+    setMailSender(async ({ to }) => {
       if (to[0] === 'person0@example.test') throw new ApiError(422, 'Invalid recipient');
       return { id: 'resend-ok' };
     });
@@ -206,7 +206,7 @@ describe('runJob', () => {
 
   it('passes the schedule time through to every mail in a scheduled job', async () => {
     const sent = [];
-    setBulkSender(async (payload) => {
+    setMailSender(async (payload) => {
       sent.push(payload);
       return { id: 'resend-1' };
     });
@@ -221,7 +221,7 @@ describe('runJob', () => {
 describe('resumeInterruptedJobs', () => {
   it('reclaims recipients left mid-send by a restart', async () => {
     const sent = [];
-    setBulkSender(async (payload) => {
+    setMailSender(async (payload) => {
       sent.push(payload.to[0]);
       return { id: 'resend-ok' };
     });

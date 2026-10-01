@@ -14,8 +14,9 @@ process.env.MAILBOX_USER ??= 'tester';
 process.env.MAILBOX_PASSWORD ??= 'test-password';
 process.env.SESSION_SECRET ??= 'test-session-secret-long-enough-to-look-real';
 process.env.MONGO_URI ??= 'mongodb://localhost:27017';
-process.env.MAX_SCHEDULED_PER_DAY ??= '60';
 process.env.RESEND_DAILY_QUOTA ??= '100';
+// MAX_SCHEDULED_PER_DAY is deliberately left unset: it derives from the quota
+// minus the reserve, and pinning it here would hide a change to that derivation.
 // config reads this once at import, so it has to be set before it loads rather
 // than per test. The real pace is two a second; the suite has no rate limit to
 // respect and should not spend half a second between stubbed sends.

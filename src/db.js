@@ -47,13 +47,16 @@ export function getCollections() {
 }
 
 /**
- * Where a bulk job's attachments live while it runs.
+ * Where attachments wait while their mail does.
  *
- * They cannot ride along in the job document: 20 MB of files is ~27 MB base64
- * encoded, against Mongo's 16 MB per-document ceiling — the same wall the drafts
- * feature hits, which is why a draft is saved without its attachments. GridFS
- * chunks them instead, so a job interrupted by a redeploy still has its files
- * when it resumes.
+ * Used by bulk jobs as they drain, and by scheduled mail across the days between
+ * being booked and being handed to Resend. They cannot ride in the owning
+ * document: 20 MB of files is ~27 MB base64 encoded, against Mongo's 16 MB
+ * per-document ceiling — the same wall the drafts feature hits, which is why a
+ * draft is saved without its attachments. GridFS chunks them instead, so a mail
+ * interrupted by a redeploy still has its files days later.
+ *
+ * The bucket name is historical; it holds both kinds now.
  */
 export function getAttachmentBucket() {
   if (!database) {
@@ -110,11 +113,13 @@ export async function connectDb() {
     const { drafts, scheduled, bulkJobs, bulkRecipients } = getCollections();
     // Drafts are always listed most-recently-edited first.
     await drafts.createIndex({ updatedAt: -1 });
-    // The Scheduled folder lists what is due soonest first, and the ledger counts
-    // by day, so both fields carry an index.
+    // The Scheduled folder lists what is due soonest first, and both the ledger
+    // and the daily dispatcher query by day and status.
     await scheduled.createIndex({ scheduledAt: 1 });
-    await scheduled.createIndex({ day: 1, status: 1 });
+    await scheduled.createIndex({ status: 1, day: 1 });
     await bulkJobs.createIndex({ createdAt: -1 });
+    // The dispatcher finds parked jobs by exactly this pair.
+    await bulkJobs.createIndex({ status: 1, day: 1 });
     // The sender claims work with findOneAndUpdate on exactly this pair.
     await bulkRecipients.createIndex({ jobId: 1, status: 1 });
 
