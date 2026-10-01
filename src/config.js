@@ -168,9 +168,17 @@ export const config = {
   mailboxAddress: required('MAILBOX_ADDRESS'),
 
   auth: {
-    user: required('MAILBOX_USER'),
-    password: required('MAILBOX_PASSWORD'),
-    sessionSecret: required('SESSION_SECRET'),
+    /*
+     * Read softly rather than demanded here, because not every entry point
+     * serves HTTP. `npm run dispatch` only hands scheduled mail to Resend — it
+     * has no sessions and no login, so requiring a mailbox password and a
+     * session secret would mean copying two unused secrets into whatever runs
+     * the schedule. assertServerConfig() below is what insists on them, and it
+     * is called by the server alone.
+     */
+    user: process.env.MAILBOX_USER,
+    password: process.env.MAILBOX_PASSWORD,
+    sessionSecret: process.env.SESSION_SECRET,
     // Renewed on activity (see refreshSessionIfStale), so this is the window of
     // inactivity you are allowed, not a hard cap on staying signed in.
     sessionMaxAgeMs: Number(process.env.SESSION_DAYS || 30) * 24 * 60 * 60 * 1000,
@@ -191,9 +199,31 @@ export const config = {
   // otherwise raising one silently leaves the other as the real limit.
   jsonBodyLimitBytes: Math.ceil(attachments.maxTotalBytes / 3) * 4 + 2 * MB,
 
-  // Holds drafts and read/unread state — the two things Resend does not model.
+  // Holds drafts, read/unread state, schedules and bulk sends.
   mongoUri: required('MONGO_URI'),
   mongoDbName: process.env.MONGO_DB || 'mailbox',
 
   isProduction,
 };
+
+/**
+ * The variables only an HTTP server needs. Called by server.js at boot, so a
+ * missing session secret still fails immediately and loudly there — while
+ * `npm run dispatch`, which serves nothing, can run without them.
+ */
+export function assertServerConfig() {
+  const missing = [
+    ['MAILBOX_USER', config.auth.user],
+    ['MAILBOX_PASSWORD', config.auth.password],
+    ['SESSION_SECRET', config.auth.sessionSecret],
+  ]
+    .filter(([, value]) => !value)
+    .map(([name]) => name);
+
+  if (missing.length) {
+    throw new Error(
+      `Missing required environment variable${missing.length === 1 ? '' : 's'}: ` +
+      `${missing.join(', ')}. Copy .env.example to .env and fill it in.`,
+    );
+  }
+}

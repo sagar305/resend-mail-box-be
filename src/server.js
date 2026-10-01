@@ -1,8 +1,12 @@
 import { createApp } from './app.js';
-import { config } from './config.js';
+import { assertServerConfig, config } from './config.js';
 import { closeDb, connectDbWithRetry } from './db.js';
 import { resumeInterruptedJobs, stopBulkSending } from './services/bulkJobs.js';
 import { startDailyDispatch, stopDailyDispatch } from './services/dispatcher.js';
+
+// The login and session variables are only needed by something that serves HTTP,
+// so they are checked here rather than at import — see assertServerConfig.
+assertServerConfig();
 
 // Listen first, then connect in the background and keep retrying. Exiting on a
 // failed database connection hides the reason behind a platform error page and

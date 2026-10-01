@@ -1,0 +1,62 @@
+name: Dispatch scheduled mail
+
+# Hands scheduled mail to Resend on the day it goes out.
+#
+# This runs here rather than inside the web service because a free Render web
+# service spins down after about fifteen minutes without traffic — it is asleep
+# at 00:00 UTC most nights, so its own timer never fires. Render's Cron Jobs need
+# a paid instance, and GitHub's scheduler is free.
+#
+# Mail is stored in MongoDB until its delivery day. Calling Resend on that day is
+# what keeps each send inside the right day's quota, which is why the schedule
+# below must stay at 00:00 UTC: that is when a date's allowance resets. Moving it
+# to a local midnight would call Resend during the previous day's window.
+
+on:
+  schedule:
+    # GitHub cron is always UTC. Do not convert this to local time.
+    - cron: '0 0 * * *'
+  # Lets you force a dispatch from the Actions tab without waiting for midnight.
+  workflow_dispatch:
+
+# Two runs handing over the same mail would be harmless — a hand-over only
+# matches mail still marked pending — but there is no reason to let them overlap.
+concurrency:
+  group: dispatch-scheduled-mail
+  cancel-in-progress: false
+
+jobs:
+  dispatch:
+    runs-on: ubuntu-latest
+    # A day's worth of mail is paced at two sends a second, so even a full date
+    # finishes well inside this. The limit is here so a hung run cannot sit and
+    # burn the account's Actions minutes.
+    timeout-minutes: 15
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version-file: .nvmrc
+          cache: npm
+
+      - run: npm ci
+
+      - name: Hand over mail due today
+        env:
+          # The only three the dispatcher needs. It serves no HTTP, so it has no
+          # use for the login or session secrets the web service requires.
+          MONGO_URI: ${{ secrets.MONGO_URI }}
+          RESEND_API_KEY: ${{ secrets.RESEND_API_KEY }}
+          MAILBOX_ADDRESS: ${{ secrets.MAILBOX_ADDRESS }}
+          # Optional, and only if you have moved them off their defaults — they
+          # have to match the web service or the two will disagree about how much
+          # of a date is bookable.
+          RESEND_DAILY_QUOTA: ${{ secrets.RESEND_DAILY_QUOTA }}
+          RESEND_DAILY_RESERVE: ${{ secrets.RESEND_DAILY_RESERVE }}
+          MAX_SCHEDULED_PER_DAY: ${{ secrets.MAX_SCHEDULED_PER_DAY }}
+          MONGO_DB: ${{ secrets.MONGO_DB }}
+        # Exits non-zero if MongoDB is unreachable or any mail was left pending,
+        # so a run that could not place its sends shows up as a failed run.
+        run: npm run dispatch

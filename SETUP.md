@@ -349,7 +349,44 @@ and an in-process timer never fires.
 A platform scheduled job is started by the platform, so it runs whether or not
 anyone has opened the app.
 
-### On Render
+### On Render's free plan — use GitHub Actions
+
+Render's own Cron Jobs need a paid instance (**$1/month minimum per cron
+service**), so on a free account the scheduler lives in GitHub instead. The
+workflow is already in this repository at
+`.github/workflows/dispatch-scheduled-mail.yml`; it only needs its secrets.
+
+Add these under **Settings → Secrets and variables → Actions** on this repo:
+
+| Secret | Value |
+| --- | --- |
+| `MONGO_URI` | the same connection string the web service uses |
+| `RESEND_API_KEY` | the same key the web service uses |
+| `MAILBOX_ADDRESS` | the same from-address |
+
+That is all three. The dispatcher serves no HTTP, so it needs no
+`MAILBOX_PASSWORD` and no `SESSION_SECRET` — the web service checks for those at
+boot instead of at import, precisely so unused secrets do not have to be copied
+here.
+
+Only add `RESEND_DAILY_QUOTA`, `RESEND_DAILY_RESERVE`, `MAX_SCHEDULED_PER_DAY` or
+`MONGO_DB` if you have moved them off their defaults on the web service. They
+have to match, or the two will disagree about how much of a date is bookable.
+
+Then open the **Actions** tab, pick **Dispatch scheduled mail**, and press **Run
+workflow** to confirm it works before relying on the schedule.
+
+Two things to know about GitHub's scheduler:
+
+- Runs can start **5–30 minutes late** under load. That is harmless here: mail
+  is scheduled for a specific time later in the day, and Resend holds it. Only a
+  send timed for the first hour of the UTC day could slip, and it would go out
+  marked late rather than not at all.
+- GitHub **disables scheduled workflows after 60 days of repository
+  inactivity**. Any commit re-enables it; the Actions tab says when it has been
+  turned off.
+
+### On Render with a paid instance
 
 1. **New → Cron Job**, pointed at this same repository and branch.
 2. **Build command:** `npm install`
@@ -357,9 +394,8 @@ anyone has opened the app.
 4. **Schedule:** `0 0 * * *` — Render reads cron schedules as UTC, which is
    exactly what is wanted here. Do not convert it to local time: midnight IST
    would call Resend at 18:30 UTC the day before and spend the wrong day's quota.
-5. **Environment variables:** the same set as the web service. It needs at least
-   `MONGO_URI`, `RESEND_API_KEY` and `MAILBOX_ADDRESS`; copying the whole set is
-   simplest and harmless. An Environment Group shared by both services saves
+5. **Environment variables:** `MONGO_URI`, `RESEND_API_KEY` and
+   `MAILBOX_ADDRESS`. An Environment Group shared with the web service saves
    keeping two copies in step.
 
 ### On Railway
@@ -369,8 +405,8 @@ Add a **Cron** schedule of `0 0 * * *` to a service whose start command is
 
 ### Any other host
 
-Anything that can run a command on a schedule works — a system crontab, a
-GitHub Actions workflow on a `schedule` trigger, or any hosted cron runner:
+Anything that can run a command on a schedule works — a system crontab, or any
+hosted cron runner:
 
 ```
 0 0 * * *  cd /path/to/resend-mail-box-be && npm run dispatch
