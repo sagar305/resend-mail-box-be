@@ -9,18 +9,26 @@ import { findDueForDispatch, handOverToResend } from './scheduled.js';
  * The daily hand-over.
  *
  * Mail is booked into MongoDB and only reaches Resend on the day it goes out.
- * This is what moves it, once a day, at 00:00 UTC.
+ * This is what moves it.
  *
- * Why that instant and not local midnight: Resend's quota is a UTC calendar day,
- * so 00:00 UTC is the moment a date's allowance resets. Running at midnight IST
+ * Why 00:00 UTC and not local midnight: Resend's quota is a UTC calendar day, so
+ * that instant is the moment a date's allowance resets. Running at midnight IST
  * would mean calling Resend at 18:30 UTC the day before, spending the previous
  * day's quota on the next day's mail — the exact problem booking-on-the-day is
  * meant to solve. It therefore fires at 05:30 IST, and the UI says so.
  *
- * It also sweeps on boot. A redeploy or an outage across midnight would otherwise
- * skip a day entirely, and the sweep picks up anything still pending whose day has
- * arrived or passed — including mail whose send time is already behind us, which
- * goes out at once rather than being dropped.
+ * Two things drive it, deliberately:
+ *
+ *   A platform scheduler running `npm run dispatch` (src/dispatch.js) is the
+ *   primary. It has to be, because the server cannot be relied on to be awake —
+ *   a free Render web service spins down after fifteen minutes without traffic,
+ *   so a single-user mailbox is asleep at 00:00 UTC most nights.
+ *
+ *   The in-process timer below is a backstop for when the server IS up, plus a
+ *   sweep on every boot so a cold start catches anything the scheduler missed.
+ *
+ * Both are safe together: a hand-over only ever matches mail still marked
+ * pending, so whichever runs first leaves nothing for the other to redo.
  */
 
 const sleep = (ms) => new Promise((resolve) => { setTimeout(resolve, ms); });
@@ -32,8 +40,12 @@ let running = false;
  * Hands over everything due. Safe to call at any time and more than once: the
  * query only ever matches mail still marked pending, and a `running` guard keeps
  * the boot sweep and the midnight firing from overlapping.
+ *
+ * `awaitJobs` makes released bulk jobs run to completion before this resolves.
+ * The long-lived server leaves them in the background and polls; a one-shot cron
+ * process has to wait, or it exits and takes the half-drained job with it.
  */
-export async function dispatchDue({ now = new Date() } = {}) {
+export async function dispatchDue({ now = new Date(), awaitJobs = false } = {}) {
   if (running) return { skipped: true };
   running = true;
 
@@ -63,7 +75,7 @@ export async function dispatchDue({ now = new Date() } = {}) {
       if (elapsed < intervalMs) await sleep(intervalMs - elapsed);
     }
 
-    summary.jobsStarted = await startDueBulkJobs(today);
+    summary.jobsStarted = await startDueBulkJobs(today, { awaitJobs });
 
     // Both the ledger and today's usage just moved.
     clearQuotaCache();
@@ -86,12 +98,12 @@ export async function dispatchDue({ now = new Date() } = {}) {
  * Releases bulk jobs whose delivery day has come. They were parked at creation
  * rather than run, so that their sends land in the right day's quota too.
  */
-async function startDueBulkJobs(today) {
+async function startDueBulkJobs(today, { awaitJobs = false } = {}) {
   const { bulkJobs } = getCollections();
   const due = await bulkJobs.find({ status: 'pending', day: { $lte: today } }).toArray();
 
   for (const job of due) {
-    await startBulkJob(job._id);
+    await startBulkJob(job._id, { wait: awaitJobs });
   }
   return due.length;
 }

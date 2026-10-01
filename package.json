@@ -7,6 +7,7 @@
   "scripts": {
     "start": "node src/server.js",
     "dev": "node --watch src/server.js",
+    "dispatch": "node src/dispatch.js",
     "test": "node --test \"test/**/*.test.js\""
   },
   "repository": {

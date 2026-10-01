@@ -196,8 +196,12 @@ export async function createBulkJob({
  *
  * Its slots were claimed when it was created, so there is nothing to re-check
  * here — only the sends themselves are still to happen.
+ *
+ * `wait` runs it to completion rather than in the background. The server does not
+ * need that (it polls), but a one-shot cron process does: exiting mid-drain would
+ * leave recipients claimed by a process that no longer exists.
  */
-export async function startBulkJob(jobId) {
+export async function startBulkJob(jobId, { wait = false } = {}) {
   const { bulkJobs } = getCollections();
   const claimed = await bulkJobs.findOneAndUpdate(
     // Conditional on still being pending, so two dispatch sweeps overlapping
@@ -206,6 +210,11 @@ export async function startBulkJob(jobId) {
     { $set: { status: 'running', updatedAt: new Date().toISOString() } },
   );
   if (!claimed) return false;
+
+  if (wait) {
+    await runJob(jobId);
+    return true;
+  }
 
   runJob(jobId).catch((error) => {
     console.error(`Bulk job ${jobId} failed: ${error.message}`);
