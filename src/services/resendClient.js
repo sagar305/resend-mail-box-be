@@ -257,7 +257,7 @@ export async function rescheduleEmail(id, scheduledAt) {
   unwrap(await resend.emails.update({ id, scheduledAt }));
 }
 
-export async function sendMail({ to, cc, bcc, subject, html, text, attachments, scheduledAt }) {
+async function sendViaResend({ to, cc, bcc, subject, html, text, attachments, scheduledAt }) {
   const payload = {
     from: config.mailboxAddress,
     to,
@@ -282,4 +282,23 @@ export async function sendMail({ to, cc, bcc, subject, html, text, attachments, 
 
   const result = unwrap(await resend.emails.send(payload));
   return { id: result.id };
+}
+
+/**
+ * The single seam for putting a mail on the wire.
+ *
+ * Everything that sends — a plain compose, the daily hand-over, each recipient of
+ * a bulk job — goes through here, so a test can stand in for Resend once and
+ * exercise the logic around it: pacing, retries, the daily dispatch, slot
+ * accounting. That logic is the part worth testing and the part hardest to reach
+ * otherwise.
+ */
+let mailSender = sendViaResend;
+
+export function setMailSender(fn) {
+  mailSender = fn ?? sendViaResend;
+}
+
+export function sendMail(payload) {
+  return mailSender(payload);
 }

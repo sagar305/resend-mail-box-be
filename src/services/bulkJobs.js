@@ -4,7 +4,7 @@ import { getCollections } from '../db.js';
 import { ApiError } from '../lib/ApiError.js';
 import { assertRecipientsResolvable, extractTokens, renderForRecipient } from '../lib/merge.js';
 import { utcDay } from '../lib/schedule.js';
-import { discardAttachments, loadAttachments, stageAttachments } from './bulkAttachments.js';
+import { discardAttachments, loadAttachments, stageAttachments } from './attachmentStore.js';
 import { assertImmediateQuota, noteImmediateSends } from './quota.js';
 import { sendMail } from './resendClient.js';
 import { releaseSlots, reserveSlots } from './slots.js';
@@ -45,16 +45,6 @@ export function stopBulkSending() {
   stopping = true;
 }
 
-/**
- * The function used to put one mail on the wire. Swappable so the loop's own
- * behaviour — pacing, claiming, retrying, halting — can be tested without
- * reaching Resend, which is the part of this file most worth testing and the
- * part hardest to reach otherwise.
- */
-let sender = sendMail;
-export function setBulkSender(fn) {
-  sender = fn ?? sendMail;
-}
 
 function toJob(doc, recipients) {
   return {
@@ -139,6 +129,11 @@ export async function createBulkJob({
     await assertImmediateQuota(recipients.length);
   }
 
+  // Parked only if its day is still ahead. A job scheduled for later today has
+  // already missed this morning's dispatch, and today is its right quota day
+  // anyway, so it runs now and Resend holds each mail until its time.
+  const parked = Boolean(day) && day > utcDay(new Date());
+
   const jobId = randomUUID();
   let staged = [];
   try {
@@ -149,7 +144,10 @@ export async function createBulkJob({
 
     await bulkJobs.insertOne({
       _id: jobId,
-      status: 'running',
+      // A scheduled job is parked until its delivery day, so its sends land in
+      // that day's Resend quota rather than in whichever day it was created.
+      // The dispatcher releases it; anything due today runs now.
+      status: parked ? 'pending' : 'running',
       subject,
       html,
       text,
@@ -182,12 +180,37 @@ export async function createBulkJob({
     throw error;
   }
 
-  // Deliberately not awaited: the caller gets its job id straight away and polls.
+  // A job due today starts now, deliberately not awaited so the caller gets its
+  // job id straight away and polls. A parked one waits for the dispatcher.
+  if (!parked) {
+    runJob(jobId).catch((error) => {
+      console.error(`Bulk job ${jobId} failed: ${error.message}`);
+    });
+  }
+
+  return getBulkJob(jobId);
+}
+
+/**
+ * Releases a parked job on its delivery day. Called by the dispatcher.
+ *
+ * Its slots were claimed when it was created, so there is nothing to re-check
+ * here — only the sends themselves are still to happen.
+ */
+export async function startBulkJob(jobId) {
+  const { bulkJobs } = getCollections();
+  const claimed = await bulkJobs.findOneAndUpdate(
+    // Conditional on still being pending, so two dispatch sweeps overlapping
+    // cannot start the same job twice.
+    { _id: jobId, status: 'pending' },
+    { $set: { status: 'running', updatedAt: new Date().toISOString() } },
+  );
+  if (!claimed) return false;
+
   runJob(jobId).catch((error) => {
     console.error(`Bulk job ${jobId} failed: ${error.message}`);
   });
-
-  return getBulkJob(jobId);
+  return true;
 }
 
 /**
@@ -285,7 +308,7 @@ async function sendToRecipient(job, recipient, files) {
   const rendered = renderForRecipient(job, recipient.vars);
 
   try {
-    const { id } = await sender({
+    const { id } = await sendMail({
       to: [recipient.email],
       // A bulk send never carries cc or bcc: copying a fixed address onto every
       // one of these mails would leak the list and defeat the whole feature.
