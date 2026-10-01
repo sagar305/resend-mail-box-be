@@ -22,7 +22,8 @@ picture.
 4. [Step 2 — Set up MongoDB](#4-step-2--set-up-mongodb)
 5. [Step 3 — Run locally](#5-step-3--run-locally)
 6. [Step 4 — Deploy the backend to Railway](#6-step-4--deploy-the-backend-to-railway)
-7. [Step 5 — Deploy the frontend to Vercel](#7-step-5--deploy-the-frontend-to-vercel)
+7. [Required — a scheduled job for the daily dispatch](#6b-required--a-scheduled-job-for-the-daily-dispatch)
+8. [Step 5 — Deploy the frontend to Vercel](#7-step-5--deploy-the-frontend-to-vercel)
 8. [Environment variable reference](#8-environment-variable-reference)
 9. [How the frontend reaches the backend, and why there is no CORS](#9-how-the-frontend-reaches-the-backend-and-why-there-is-no-cors)
 10. [Libraries used](#10-libraries-used)
@@ -324,6 +325,118 @@ MongoDB, so the service is stateless and survives redeploys.
 > second service in the same project and use its **private network** connection
 > string as `MONGO_URI`. Then there is no IP allowlist and Mongo is never
 > publicly exposed.
+
+---
+
+## 6b. Required — a scheduled job for the daily dispatch
+
+**Scheduled mail will not send without this.** Skip it and mail you schedule
+sits in MongoDB until someone happens to open the app.
+
+### Why it is needed
+
+A scheduled mail is stored in MongoDB and handed to Resend only on the day it
+goes out. Resend's quota is a UTC calendar day, so calling them on the delivery
+day puts the send inside that day's allowance — which is what lets you lay out a
+week of mail in one sitting without exhausting the day you booked it on.
+
+Something has to make that hand-over at 00:00 UTC. The web service does arm its
+own timer and sweep on every boot, but that cannot be relied on alone: a free
+web service on Render or Railway **spins down after about fifteen minutes
+without traffic**, so a single-user mailbox is asleep at 00:00 UTC most nights
+and an in-process timer never fires.
+
+A platform scheduled job is started by the platform, so it runs whether or not
+anyone has opened the app.
+
+### On Render's free plan — use GitHub Actions
+
+Render's own Cron Jobs need a paid instance (**$1/month minimum per cron
+service**), so on a free account the scheduler lives in GitHub instead. The
+workflow is already in this repository at
+`.github/workflows/dispatch-scheduled-mail.yml`; it only needs its secrets.
+
+Add these under **Settings → Secrets and variables → Actions** on this repo:
+
+| Secret | Value |
+| --- | --- |
+| `MONGO_URI` | the same connection string the web service uses |
+| `RESEND_API_KEY` | the same key the web service uses |
+| `MAILBOX_ADDRESS` | the same from-address |
+
+That is all three. The dispatcher serves no HTTP, so it needs no
+`MAILBOX_PASSWORD` and no `SESSION_SECRET` — the web service checks for those at
+boot instead of at import, precisely so unused secrets do not have to be copied
+here.
+
+Only add `RESEND_DAILY_QUOTA`, `RESEND_DAILY_RESERVE`, `MAX_SCHEDULED_PER_DAY` or
+`MONGO_DB` if you have moved them off their defaults on the web service. They
+have to match, or the two will disagree about how much of a date is bookable.
+
+Then open the **Actions** tab, pick **Dispatch scheduled mail**, and press **Run
+workflow** to confirm it works before relying on the schedule.
+
+Two things to know about GitHub's scheduler:
+
+- Runs can start **5–30 minutes late** under load. That is harmless here: mail
+  is scheduled for a specific time later in the day, and Resend holds it. Only a
+  send timed for the first hour of the UTC day could slip, and it would go out
+  marked late rather than not at all.
+- GitHub **disables scheduled workflows after 60 days of repository
+  inactivity**. Any commit re-enables it; the Actions tab says when it has been
+  turned off.
+
+### On Render with a paid instance
+
+1. **New → Cron Job**, pointed at this same repository and branch.
+2. **Build command:** `npm install`
+3. **Command:** `npm run dispatch`
+4. **Schedule:** `0 0 * * *` — Render reads cron schedules as UTC, which is
+   exactly what is wanted here. Do not convert it to local time: midnight IST
+   would call Resend at 18:30 UTC the day before and spend the wrong day's quota.
+5. **Environment variables:** `MONGO_URI`, `RESEND_API_KEY` and
+   `MAILBOX_ADDRESS`. An Environment Group shared with the web service saves
+   keeping two copies in step.
+
+### On Railway
+
+Add a **Cron** schedule of `0 0 * * *` to a service whose start command is
+`npm run dispatch`, sharing the web service's variables.
+
+### Any other host
+
+Anything that can run a command on a schedule works — a system crontab, or any
+hosted cron runner:
+
+```
+0 0 * * *  cd /path/to/resend-mail-box-be && npm run dispatch
+```
+
+### Checking it works
+
+The run logs one line:
+
+```
+Dispatch complete: 50 handed to Resend
+```
+
+It exits non-zero if it could not reach MongoDB, or if any mail was left
+pending, so a failed run shows as failed rather than quietly sending nothing.
+Mail left pending is retried by the next run.
+
+Run it by hand any time to force a dispatch — it is safe to run repeatedly,
+because a hand-over only ever matches mail still marked pending:
+
+```bash
+npm run dispatch
+```
+
+### What happens if a run is missed
+
+Nothing is lost. The next run — scheduled, manual, or the sweep on the web
+service's next boot — picks up everything still pending whose day has arrived.
+Mail whose send time has already passed goes out immediately and is marked
+`late` rather than being dropped.
 
 ---
 

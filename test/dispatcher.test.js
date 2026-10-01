@@ -196,6 +196,46 @@ describe('dispatchDue', () => {
     assert.notEqual((await getBulkJob('job-1')).status, 'pending');
   });
 
+  it('runs a parked bulk job to completion when asked to wait', async () => {
+    // What the one-shot cron process needs: the job fully drained before the
+    // call resolves, because that process exits straight afterwards and would
+    // otherwise take a half-sent job with it.
+    await db.collection('bulkJobs').insertOne({
+      _id: 'job-2',
+      status: 'pending',
+      subject: 'Hi {{name}}',
+      html: '<p>Hello {{name}}</p>',
+      text: 'Hello {{name}}',
+      columns: ['name'],
+      tokens: ['name'],
+      scheduledAt: '2026-10-05T11:30:00.000Z',
+      day: TODAY,
+      attachments: [],
+      totals: { total: 2, sent: 0, failed: 0 },
+      createdAt: '2026-10-01T09:00:00.000Z',
+      updatedAt: '2026-10-01T09:00:00.000Z',
+      error: null,
+    });
+    await db.collection('bulkRecipients').insertMany([0, 1].map((index) => ({
+      _id: `job-2:${index}`,
+      jobId: 'job-2',
+      order: index,
+      email: `person${index}@example.test`,
+      vars: { name: `Person ${index}` },
+      status: 'pending',
+      attempts: 0,
+      resendId: null,
+      error: null,
+    })));
+
+    await dispatchDue({ now: NOW, awaitJobs: true });
+
+    // No sleep here on purpose — if awaiting did not work, this is where it shows.
+    const job = await getBulkJob('job-2');
+    assert.equal(job.status, 'completed');
+    assert.equal(job.totals.sent, 2);
+  });
+
   it('leaves the Scheduled folder showing both pending and handed-over mail', async () => {
     await reserveSlots(TODAY, 1);
     await reserveSlots(TOMORROW, 1);
