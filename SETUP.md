@@ -345,24 +345,18 @@ the timers in `src/server.js` do on Railway.
    | `/api/cron/dispatch` | `0 0 * * *` (00:00 UTC) | Hands the day's scheduled mail to Resend, starts parked bulk sends, resumes stalled ones |
    | `/api/cron/resume-bulk` | `* * * * *` | Restarts any bulk send whose run stopped |
 
-   **The every-minute job needs a Pro plan.** Hobby allows only daily cron jobs,
-   and a deploy with `* * * * *` fails. On Hobby, delete that entry. Stalled bulk
-   sends are then resumed by the daily job and, while the app is open, by any
-   request (checked at most once a minute), which is enough while you watch one.
+   Both cron jobs and the 800 s `maxDuration` in `vercel.json` need a **Pro**
+   plan. On Hobby the deploy fails: delete the `resume-bulk` entry and the
+   `functions` block, and set `BULK_RUN_BUDGET_SECONDS=270`.
 
 What changes compared with Railway:
 
-- **Bulk sends** run after the response through `waitUntil()`, until the
-  function's `maxDuration` (300 s by default). A run stops 30 s before that
-  (`BULK_RUN_BUDGET_SECONDS`, default 270 on Vercel). That covers ~540 recipients
-  at 2/s, and the next run carries on from where it stopped. Each recipient's
-  state is in MongoDB, and a lease on the job keeps two instances from sending
-  it at once. Nobody gets the same mail twice. On Pro you can raise `maxDuration`
-  to 800 s and set `BULK_RUN_BUDGET_SECONDS=770` for ~1,500 recipients per run:
-
-  ```json
-  "functions": { "src/app.js": { "maxDuration": 800 } }
-  ```
+- **Bulk sends** run after the response through `waitUntil()`, up to the
+  function's `maxDuration` (800 s in `vercel.json`). A run stops 30 s before that
+  (`BULK_RUN_BUDGET_SECONDS`, default 770 on Vercel), which covers ~1,500
+  recipients at 2/s, and the next run (within a minute, from the cron) carries on
+  where it stopped. Each recipient's state is in MongoDB, and a lease on the job
+  keeps two instances from sending it at once, so nobody is mailed twice.
 
 - **Attachments** are limited to **3 MB in total**. Vercel rejects request
   bodies over 4.5 MB, and attachments arrive base64-encoded (+33%) inside the

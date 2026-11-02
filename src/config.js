@@ -182,13 +182,14 @@ const bulk = {
   /*
    * How long one invocation may keep sending before it stops at a clean point
    * and leaves the rest for the next run. 0 means no limit, which is right for a
-   * long-lived server. On Vercel the function is killed at its maxDuration
-   * (300 s by default), so the default stops 30 s short of that. If you raise
-   * maxDuration on a Pro plan (up to 800 s), raise this to match: 770 s at two a
-   * second is about 1,500 recipients per run.
+   * long-lived server. On Vercel the function is killed at its maxDuration,
+   * which vercel.json sets to 800 s (the Pro maximum), so the default stops 30 s
+   * short of that: 770 s at two a second is about 1,500 recipients per run.
+   * Keep the two in step — if maxDuration is lowered, lower this with it.
+   * Vercel's own deadline is also honoured where it is known (see runDeadline).
    */
   runBudgetMs: parsePositiveIntOrZero(
-    process.env.BULK_RUN_BUDGET_SECONDS, onVercel ? 270 : 0, 'BULK_RUN_BUDGET_SECONDS',
+    process.env.BULK_RUN_BUDGET_SECONDS, onVercel ? 770 : 0, 'BULK_RUN_BUDGET_SECONDS',
   ) * 1000,
 };
 
