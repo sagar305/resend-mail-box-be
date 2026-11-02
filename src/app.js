@@ -1,7 +1,7 @@
 import express from 'express';
 import cookieParser from 'cookie-parser';
 import { config } from './config.js';
-import { getDbStatus } from './db.js';
+import { connectDb, getDbStatus } from './db.js';
 import { requireAuth } from './middleware/auth.js';
 import { corsMiddleware } from './middleware/cors.js';
 import { errorHandler, notFoundHandler } from './middleware/errorHandler.js';
@@ -50,4 +50,31 @@ export function createApp() {
   app.use(errorHandler);
 
   return app;
+}
+
+/*
+ * Serverless entry point (Vercel).
+ *
+ * Vercel's Express preset imports this file and calls its default export once per
+ * request; it never runs src/server.js, so nothing would ever dial MongoDB. This
+ * handler builds the app on first use and connects lazily. The connection
+ * promise is shared, so concurrent requests on a cold instance wait on one dial,
+ * and it is dropped on failure so the next request tries again — meanwhile the
+ * request still goes through, and data routes answer 503 as they do on Railway.
+ *
+ * Built lazily so importing this module (server.js, tests) has no side effects.
+ */
+let serverlessApp = null;
+let connecting = null;
+
+export default async function handler(req, res) {
+  serverlessApp ??= createApp();
+  if (!getDbStatus().connected) {
+    connecting ??= connectDb().catch((error) => {
+      connecting = null;
+      console.error(`MongoDB connection failed: ${error.message}`);
+    });
+    await connecting;
+  }
+  return serverlessApp(req, res);
 }
