@@ -9,7 +9,8 @@ import { findDueForDispatch, handOverToResend } from './scheduled.js';
  * The daily hand-over.
  *
  * Mail is booked into MongoDB and only reaches Resend on the day it goes out.
- * This is what moves it, once a day, at 00:00 UTC.
+ * This is what moves it, once a day, at 00:00 UTC — from a timer on a long-lived
+ * server, or from the Vercel cron calling GET /api/cron/dispatch.
  *
  * Why that instant and not local midnight: Resend's quota is a UTC calendar day,
  * so 00:00 UTC is the moment a date's allowance resets. Running at midnight IST
@@ -79,6 +80,39 @@ export async function dispatchDue({ now = new Date() } = {}) {
     return summary;
   } finally {
     running = false;
+  }
+}
+
+const DUPLICATE_KEY = 11000;
+const DISPATCH_LOCK_MS = 10 * 60_000;
+
+/**
+ * dispatchDue, but at most one at a time across every instance.
+ *
+ * The in-process `running` flag is enough for a single server. On Vercel each
+ * cron call may land on a different instance, and Vercel may deliver the same
+ * cron event twice; two sweeps reading the same pending mail would both hand it
+ * to Resend. A lock document in Mongo closes that gap. It expires on its own, so
+ * an instance killed mid-sweep cannot block tomorrow's.
+ */
+export async function dispatchDueExclusive(options) {
+  const { locks } = getCollections();
+  const now = new Date();
+  try {
+    // Matches a free or expired lock; otherwise the upsert collides on _id.
+    await locks.updateOne(
+      { _id: 'dispatch', $or: [{ until: null }, { until: { $lt: now.toISOString() } }] },
+      { $set: { until: new Date(now.getTime() + DISPATCH_LOCK_MS).toISOString() } },
+      { upsert: true },
+    );
+  } catch (error) {
+    if (error?.code === DUPLICATE_KEY) return { skipped: true, reason: 'already running' };
+    throw error;
+  }
+  try {
+    return await dispatchDue(options);
+  } finally {
+    await locks.updateOne({ _id: 'dispatch' }, { $set: { until: null } });
   }
 }
 

@@ -17,6 +17,11 @@ function parseBoolean(value, fallback) {
 
 const isProduction = process.env.NODE_ENV === 'production';
 
+// Vercel sets VERCEL=1 in every deployment. Serverless changes three things here:
+// requests are capped at 4.5 MB, a function is frozen once it has answered, and
+// it is killed at its maxDuration — see the attachment cap and bulk.runBudgetMs.
+const onVercel = Boolean(process.env.VERCEL);
+
 // Comma-separated. An entry may be an exact origin ("https://app.vercel.app"),
 // a wildcard host ("*.vercel.app") to cover preview deploys, or "*".
 const corsOrigins = (process.env.CORS_ORIGIN || 'http://localhost:5173')
@@ -62,6 +67,25 @@ const attachments = {
   ],
 };
 
+/*
+ * Vercel refuses any request body over 4.5 MB before it reaches this code, and
+ * attachments arrive base64 encoded inside the JSON body, at 4/3 their size.
+ * 3 MB of files is 4 MB encoded, which leaves ~0.5 MB for the HTML and the rest
+ * of the payload. Anything larger would be a 413 from Vercel's edge with no
+ * explanation, so the limit is lowered here — and GET /api/mail/limits hands
+ * the lowered number to the compose form, which then warns before sending.
+ */
+const VERCEL_MAX_ATTACHMENTS_BYTES = 3 * MB;
+if (onVercel && attachments.maxTotalBytes > VERCEL_MAX_ATTACHMENTS_BYTES) {
+  if (process.env.MAX_ATTACHMENTS_TOTAL_MB) {
+    console.warn(
+      `MAX_ATTACHMENTS_TOTAL_MB=${process.env.MAX_ATTACHMENTS_TOTAL_MB} does not fit Vercel's ` +
+      '4.5 MB request limit once base64 encoded. Using 3.',
+    );
+  }
+  attachments.maxTotalBytes = VERCEL_MAX_ATTACHMENTS_BYTES;
+}
+
 if (attachments.maxFileBytes > attachments.maxTotalBytes) {
   attachments.maxFileBytes = attachments.maxTotalBytes;
 }
@@ -83,6 +107,11 @@ function parsePositiveInt(value, fallback, name) {
     throw new Error(`${name} must be a positive integer (got "${value}")`);
   }
   return number;
+}
+
+function parsePositiveIntOrZero(value, fallback, name) {
+  if (value === '0') return 0;
+  return parsePositiveInt(value, fallback, name);
 }
 
 const quota = {
@@ -150,6 +179,17 @@ const bulk = {
   rateLimitBackoffMs: parsePositiveInt(
     process.env.RATE_LIMIT_BACKOFF_MS, 5_000, 'RATE_LIMIT_BACKOFF_MS',
   ),
+  /*
+   * How long one invocation may keep sending before it stops at a clean point
+   * and leaves the rest for the next run. 0 means no limit, which is right for a
+   * long-lived server. On Vercel the function is killed at its maxDuration
+   * (300 s by default), so the default stops 30 s short of that. If you raise
+   * maxDuration on a Pro plan (up to 800 s), raise this to match: 770 s at two a
+   * second is about 1,500 recipients per run.
+   */
+  runBudgetMs: parsePositiveIntOrZero(
+    process.env.BULK_RUN_BUDGET_SECONDS, onVercel ? 270 : 0, 'BULK_RUN_BUDGET_SECONDS',
+  ) * 1000,
 };
 
 // The cap is now derived from the quota, so the two cannot disagree by
@@ -196,4 +236,9 @@ export const config = {
   mongoDbName: process.env.MONGO_DB || 'mailbox',
 
   isProduction,
+  onVercel,
+
+  // Vercel sends `Authorization: Bearer <CRON_SECRET>` with every cron request.
+  // The cron routes refuse to run without it, so they cannot be called by anyone.
+  cronSecret: process.env.CRON_SECRET || null,
 };

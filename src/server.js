@@ -25,7 +25,7 @@ const server = createApp().listen(config.port, '0.0.0.0', () => {
 // a restart that happened across midnight.
 connectDbWithRetry({
   onConnected: async () => {
-    await resumeInterruptedJobs().catch((error) => {
+    await resumeInterruptedJobs({ force: true }).catch((error) => {
       console.error(`Could not resume interrupted bulk sends: ${error.message}`);
     });
     startDailyDispatch();

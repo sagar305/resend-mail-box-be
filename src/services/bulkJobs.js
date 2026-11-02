@@ -2,6 +2,7 @@ import { randomUUID } from 'node:crypto';
 import { config } from '../config.js';
 import { getCollections } from '../db.js';
 import { ApiError } from '../lib/ApiError.js';
+import { runDeadline, runInBackground } from '../lib/background.js';
 import { assertRecipientsResolvable, extractTokens, renderForRecipient } from '../lib/merge.js';
 import { utcDay } from '../lib/schedule.js';
 import { discardAttachments, loadAttachments, stageAttachments } from './attachmentStore.js';
@@ -19,16 +20,31 @@ import { releaseSlots, reserveSlots } from './slots.js';
  * thirty seconds — far too long to hold an HTTP request open. The work happens
  * after the response, and progress is polled.
  *
- * There is no queue and no worker process: server.js is a single Express app
- * that Railway restarts on every deploy. So the state that matters lives in
- * Mongo, a row per recipient, and an interrupted job resumes from it on boot
+ * There is no queue and no worker process. On Railway server.js is a single
+ * Express app restarted on every deploy; on Vercel every request may land on a
+ * different short-lived instance that is killed at its maxDuration. So the
+ * state that matters lives in Mongo, a row per recipient, and an interrupted job
+ * resumes from it — on boot, from the resume cron, or on the next request —
  * rather than starting over and mailing people twice.
+ *
+ * Because several instances may try to resume the same job, a runner first takes
+ * a lease on it in Mongo. Only the lease holder sends, so the pace stays under
+ * the rate limit, and holding it proves any recipient left `sending` was claimed
+ * by a runner that is gone.
  *
  * And the batch endpoint is not an option here, because it drops attachments.
  * Every send goes through the single-email path, paced by hand.
  */
 
 const MAX_ATTEMPTS_PER_RECIPIENT = 3;
+
+/*
+ * How long a runner's claim on a job lasts without renewal. It is renewed before
+ * every send, and one send plus a 429 backoff is a few seconds, so a live runner
+ * never comes near it. A runner that was killed simply stops renewing, and the
+ * job becomes resumable this long after it died.
+ */
+const LEASE_MS = 90_000;
 
 /** Jobs with a runner already attached, so a resume or a second call cannot double-send. */
 const running = new Set();
@@ -182,11 +198,7 @@ export async function createBulkJob({
 
   // A job due today starts now, deliberately not awaited so the caller gets its
   // job id straight away and polls. A parked one waits for the dispatcher.
-  if (!parked) {
-    runJob(jobId).catch((error) => {
-      console.error(`Bulk job ${jobId} failed: ${error.message}`);
-    });
-  }
+  if (!parked) runInBackground(runJob(jobId), `Bulk job ${jobId} failed`);
 
   return getBulkJob(jobId);
 }
@@ -207,28 +219,84 @@ export async function startBulkJob(jobId) {
   );
   if (!claimed) return false;
 
-  runJob(jobId).catch((error) => {
-    console.error(`Bulk job ${jobId} failed: ${error.message}`);
-  });
+  runInBackground(runJob(jobId), `Bulk job ${jobId} failed`);
   return true;
+}
+
+/**
+ * Takes the job's lease if nobody holds a live one. `force` ignores an unexpired
+ * lease: a single server that has just booted knows any lease is from the
+ * process it replaced.
+ */
+async function acquireLease(jobId, owner, { force = false } = {}) {
+  const { bulkJobs } = getCollections();
+  const now = new Date();
+  const free = force ? {} : {
+    $or: [{ leaseUntil: null }, { leaseUntil: { $lt: now.toISOString() } }],
+  };
+  const taken = await bulkJobs.findOneAndUpdate(
+    { _id: jobId, status: 'running', ...free },
+    {
+      $set: {
+        leaseOwner: owner,
+        leaseUntil: new Date(now.getTime() + LEASE_MS).toISOString(),
+      },
+    },
+  );
+  return Boolean(taken);
+}
+
+/** Extends the lease; false means another runner has taken the job over. */
+async function renewLease(jobId, owner) {
+  const { bulkJobs } = getCollections();
+  const result = await bulkJobs.updateOne(
+    { _id: jobId, leaseOwner: owner },
+    { $set: { leaseUntil: new Date(Date.now() + LEASE_MS).toISOString() } },
+  );
+  return result.matchedCount > 0;
+}
+
+async function releaseLease(jobId, owner) {
+  const { bulkJobs } = getCollections();
+  await bulkJobs.updateOne(
+    { _id: jobId, leaseOwner: owner },
+    { $set: { leaseOwner: null, leaseUntil: null } },
+  );
 }
 
 /**
  * Sends a job's remaining recipients, paced under the rate limit.
  *
- * Recipients are claimed one at a time with a conditional update, so a resumed
- * runner and a live one can never pick up the same person. A claim that is left
- * in `sending` by a crash is reset on boot rather than here — from inside the
- * process there is no way to tell a stalled claim from one in flight.
+ * Recipients are claimed one at a time with a conditional update, so two runners
+ * could never pick up the same person — and the lease means two never run at
+ * once. A recipient left in `sending` is reset as soon as the lease is held:
+ * a live runner would still hold the lease, so whoever left it is gone.
+ *
+ * A run stops at a clean point before the function's time runs out, leaving the
+ * job `running` with its remaining recipients `pending` for the next run.
  */
-export async function runJob(jobId) {
+export async function runJob(jobId, { force = false } = {}) {
   if (running.has(jobId)) return;
   running.add(jobId);
 
   const { bulkJobs, bulkRecipients } = getCollections();
   const intervalMs = Math.ceil(1000 / config.bulk.sendsPerSecond);
+  const stopAt = runDeadline();
+  const owner = randomUUID();
+  let leased = false;
 
   try {
+    leased = await acquireLease(jobId, owner, { force });
+    if (!leased) return;
+
+    const reclaimed = await bulkRecipients.updateMany(
+      { jobId, status: 'sending' },
+      { $set: { status: 'pending' } },
+    );
+    if (reclaimed.modifiedCount) {
+      console.log(`Bulk job ${jobId}: reclaimed ${reclaimed.modifiedCount} interrupted send(s)`);
+    }
+
     const job = await bulkJobs.findOne({ _id: jobId });
     if (!job || job.status !== 'running') return;
 
@@ -238,6 +306,14 @@ export async function runJob(jobId) {
     for (;;) {
       if (stopping) {
         console.log(`Bulk job ${jobId} paused for shutdown; it resumes on boot.`);
+        return;
+      }
+      if (Date.now() >= stopAt) {
+        console.log(`Bulk job ${jobId} reached this run's time limit; the next run resumes it.`);
+        return;
+      }
+      if (!(await renewLease(jobId, owner))) {
+        console.log(`Bulk job ${jobId} was taken over by another runner.`);
         return;
       }
 
@@ -299,6 +375,12 @@ export async function runJob(jobId) {
 
     await finishJob(jobId);
   } finally {
+    if (leased) {
+      await releaseLease(jobId, owner).catch((error) => {
+        // Not fatal: the lease expires on its own after LEASE_MS.
+        console.error(`Bulk job ${jobId}: could not release lease: ${error.message}`);
+      });
+    }
     running.delete(jobId);
   }
 }
@@ -426,37 +508,32 @@ export async function retryFailedRecipients(jobId) {
     },
   );
 
-  runJob(jobId).catch((error) => {
-    console.error(`Bulk job ${jobId} retry failed: ${error.message}`);
-  });
+  runInBackground(runJob(jobId), `Bulk job ${jobId} retry failed`);
   return getBulkJob(jobId);
 }
 
 /**
- * Picks up jobs left mid-flight by a restart.
+ * Picks up jobs that are running but have no live runner: left mid-flight by a
+ * restart, or by a serverless function that hit its time limit or was killed.
  *
- * Anything stuck in `sending` was claimed by a process that is gone, so it never
- * completed and is safe to hand out again — the claim is what makes that
- * knowable. Called once at boot, after the database connects.
+ * Called at boot (with `force`, since a fresh single server knows the old leases
+ * are dead), by the Vercel resume cron, and opportunistically on requests. Jobs
+ * whose lease is still live are skipped — their runner is working on them. The
+ * runners themselves reset recipients stuck in `sending` once they hold the lease.
  */
-export async function resumeInterruptedJobs() {
-  const { bulkJobs, bulkRecipients } = getCollections();
-  const jobs = await bulkJobs.find({ status: 'running' }).toArray();
+export async function resumeInterruptedJobs({ force = false } = {}) {
+  const { bulkJobs } = getCollections();
+  const filter = { status: 'running' };
+  if (!force) {
+    filter.$or = [{ leaseUntil: null }, { leaseUntil: { $lt: new Date().toISOString() } }];
+  }
+  const jobs = await bulkJobs.find(filter).toArray();
   if (!jobs.length) return 0;
 
   for (const job of jobs) {
-    const reclaimed = await bulkRecipients.updateMany(
-      { jobId: job._id, status: 'sending' },
-      { $set: { status: 'pending' } },
-    );
-    if (reclaimed.modifiedCount) {
-      console.log(`Bulk job ${job._id}: reclaimed ${reclaimed.modifiedCount} interrupted send(s)`);
-    }
-    runJob(job._id).catch((error) => {
-      console.error(`Bulk job ${job._id} could not resume: ${error.message}`);
-    });
+    runInBackground(runJob(job._id, { force }), `Bulk job ${job._id} could not resume`);
   }
 
-  console.log(`Resumed ${jobs.length} interrupted bulk send(s)`);
+  console.log(`Resuming ${jobs.length} interrupted bulk send(s)`);
   return jobs.length;
 }

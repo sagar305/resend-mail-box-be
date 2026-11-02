@@ -36,6 +36,8 @@ function matchesCondition(value, condition) {
 function matches(doc, filter) {
   return Object.entries(filter ?? {}).every(([field, condition]) => {
     if (field === '$or') return condition.some((sub) => matches(doc, sub));
+    // Mongo's `{ field: null }` matches a null value and an absent field alike.
+    if (condition === null) return doc[field] == null;
     // An absent field is `undefined`; `{ count: { $lte: 5 } }` must not match a
     // document with no count, which is how real Mongo behaves.
     if (doc[field] === undefined && condition !== undefined && typeof condition === 'object') {

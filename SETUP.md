@@ -325,6 +325,52 @@ MongoDB, so the service is stateless and survives redeploys.
 > string as `MONGO_URI`. Then there is no IP allowlist and Mongo is never
 > publicly exposed.
 
+### Alternative: deploy the backend to Vercel instead
+
+The backend also runs on Vercel as a serverless function. Vercel detects
+Express and serves `src/app.js`; `vercel.json` adds the cron jobs that do what
+the timers in `src/server.js` do on Railway.
+
+1. **Import the repo** on Vercel. No build settings are needed.
+2. **Environment variables** (Project → Settings → Environment Variables): the
+   six required ones from [section 8](#8-environment-variable-reference), plus
+   **`CRON_SECRET`**, a long random string (`openssl rand -hex 32`). Vercel
+   sends it with every cron call, and the cron endpoints refuse to run without it.
+3. **MongoDB Atlas → Network Access**: allow `0.0.0.0/0`. Vercel has no fixed
+   outbound IPs.
+4. **Cron jobs** (`vercel.json`):
+
+   | Path | Schedule | What it does |
+   |---|---|---|
+   | `/api/cron/dispatch` | `0 0 * * *` (00:00 UTC) | Hands the day's scheduled mail to Resend, starts parked bulk sends, resumes stalled ones |
+   | `/api/cron/resume-bulk` | `* * * * *` | Restarts any bulk send whose run stopped |
+
+   **The every-minute job needs a Pro plan.** Hobby allows only daily cron jobs,
+   and a deploy with `* * * * *` fails. On Hobby, delete that entry. Stalled bulk
+   sends are then resumed by the daily job and, while the app is open, by any
+   request (checked at most once a minute), which is enough while you watch one.
+
+What changes compared with Railway:
+
+- **Bulk sends** run after the response through `waitUntil()`, until the
+  function's `maxDuration` (300 s by default). A run stops 30 s before that
+  (`BULK_RUN_BUDGET_SECONDS`, default 270 on Vercel). That covers ~540 recipients
+  at 2/s, and the next run carries on from where it stopped. Each recipient's
+  state is in MongoDB, and a lease on the job keeps two instances from sending
+  it at once. Nobody gets the same mail twice. On Pro you can raise `maxDuration`
+  to 800 s and set `BULK_RUN_BUDGET_SECONDS=770` for ~1,500 recipients per run:
+
+  ```json
+  "functions": { "src/app.js": { "maxDuration": 800 } }
+  ```
+
+- **Attachments** are limited to **3 MB in total**. Vercel rejects request
+  bodies over 4.5 MB, and attachments arrive base64-encoded (+33%) inside the
+  JSON body. A larger `MAX_ATTACHMENTS_TOTAL_MB` is lowered to 3 with a warning,
+  and `GET /api/mail/limits` reports the lowered figure, so the compose form
+  warns before sending. Downloading attachments is not affected (it redirects
+  to Resend).
+
 ---
 
 ## 7. Step 5 — Deploy the frontend to Vercel

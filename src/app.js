@@ -5,9 +5,12 @@ import { connectDb, getDbStatus } from './db.js';
 import { requireAuth } from './middleware/auth.js';
 import { corsMiddleware } from './middleware/cors.js';
 import { errorHandler, notFoundHandler } from './middleware/errorHandler.js';
+import { runInBackground } from './lib/background.js';
 import { authRouter } from './routes/auth.js';
+import { cronRouter } from './routes/cron.js';
 import { draftsRouter } from './routes/drafts.js';
 import { mailRouter } from './routes/mail.js';
+import { resumeInterruptedJobs } from './services/bulkJobs.js';
 
 /** Builds the app. Assumes the database is already connected. */
 export function createApp() {
@@ -43,6 +46,8 @@ export function createApp() {
   });
 
   app.use('/api/auth', authRouter);
+  // Authenticated by CRON_SECRET, not the session cookie.
+  app.use('/api/cron', cronRouter);
   app.use('/api/mail', requireAuth, mailRouter);
   app.use('/api/drafts', requireAuth, draftsRouter);
 
@@ -63,9 +68,15 @@ export function createApp() {
  * request still goes through, and data routes answer 503 as they do on Railway.
  *
  * Built lazily so importing this module (server.js, tests) has no side effects.
+ *
+ * It also checks, at most once a minute per instance, for bulk sends whose runner
+ * stopped. The compose screen polls a running job, so while you watch one it
+ * keeps moving even without the per-minute cron (which Hobby plans cannot have).
  */
 let serverlessApp = null;
 let connecting = null;
+let lastResumeSweep = 0;
+const RESUME_SWEEP_INTERVAL_MS = 60_000;
 
 export default async function handler(req, res) {
   serverlessApp ??= createApp();
@@ -75,6 +86,10 @@ export default async function handler(req, res) {
       console.error(`MongoDB connection failed: ${error.message}`);
     });
     await connecting;
+  }
+  if (getDbStatus().connected && Date.now() - lastResumeSweep > RESUME_SWEEP_INTERVAL_MS) {
+    lastResumeSweep = Date.now();
+    runInBackground(resumeInterruptedJobs(), 'Bulk resume sweep failed');
   }
   return serverlessApp(req, res);
 }

@@ -43,6 +43,8 @@ export function getCollections() {
     scheduleCounters: database.collection('scheduleCounters'),
     bulkJobs: database.collection('bulkJobs'),
     bulkRecipients: database.collection('bulkRecipients'),
+    // Cross-instance mutexes for work that must not overlap (the daily dispatch).
+    locks: database.collection('locks'),
   };
 }
 
