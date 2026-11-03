@@ -1,0 +1,245 @@
+import dotenv from 'dotenv';
+
+dotenv.config();
+
+function required(name) {
+  const value = process.env[name];
+  if (!value) {
+    throw new Error(`Missing required environment variable: ${name}. Copy .env.example to .env and fill it in.`);
+  }
+  return value;
+}
+
+function parseBoolean(value, fallback) {
+  if (value === undefined || value === '') return fallback;
+  return ['1', 'true', 'yes'].includes(String(value).toLowerCase());
+}
+
+const isProduction = process.env.NODE_ENV === 'production';
+
+// Vercel sets VERCEL=1 in every deployment. Serverless changes three things here:
+// requests are capped at 4.5 MB, a function is frozen once it has answered, and
+// it is killed at its maxDuration — see the attachment cap and bulk.runBudgetMs.
+const onVercel = Boolean(process.env.VERCEL);
+
+// Comma-separated. An entry may be an exact origin ("https://app.vercel.app"),
+// a wildcard host ("*.vercel.app") to cover preview deploys, or "*".
+const corsOrigins = (process.env.CORS_ORIGIN || 'http://localhost:5173')
+  .split(',')
+  .map((origin) => origin.trim())
+  .filter(Boolean);
+
+const cookieSameSite = (process.env.COOKIE_SAMESITE || 'lax').toLowerCase();
+if (!['lax', 'strict', 'none'].includes(cookieSameSite)) {
+  throw new Error(`COOKIE_SAMESITE must be lax, strict or none (got "${cookieSameSite}")`);
+}
+
+const MB = 1024 * 1024;
+
+function parseMegabytes(value, fallback, name) {
+  if (value === undefined || value === '') return fallback * MB;
+  const megabytes = Number(value);
+  if (!Number.isFinite(megabytes) || megabytes <= 0) {
+    throw new Error(`${name} must be a positive number of megabytes (got "${value}")`);
+  }
+  return Math.round(megabytes * MB);
+}
+
+// Resend's hard ceiling is 40 MB per email measured AFTER base64 encoding, which
+// is what our own limits below have to stay under once inflated by 4/3.
+const RESEND_MAX_ENCODED_BYTES = 40 * MB;
+
+const attachments = {
+  maxCount: Number(process.env.MAX_ATTACHMENT_COUNT || 10),
+  maxFileBytes: parseMegabytes(process.env.MAX_ATTACHMENT_MB, 10, 'MAX_ATTACHMENT_MB'),
+  maxTotalBytes: parseMegabytes(process.env.MAX_ATTACHMENTS_TOTAL_MB, 20, 'MAX_ATTACHMENTS_TOTAL_MB'),
+  /**
+   * Extensions the big mailbox providers (Gmail, Outlook) reject outright.
+   * Resend itself accepts them, so this is our policy, not the API's — but a mail
+   * that is guaranteed to bounce is worth refusing before it costs an API call.
+   */
+  blockedExtensions: [
+    'ade', 'adp', 'apk', 'appx', 'appxbundle', 'bat', 'cab', 'chm', 'cmd', 'com', 'cpl',
+    'diagcab', 'diagcfg', 'diagpack', 'dll', 'dmg', 'ex', 'ex_', 'exe', 'gadget', 'hta',
+    'img', 'ins', 'iso', 'isp', 'jar', 'jnlp', 'js', 'jse', 'lib', 'lnk', 'mde', 'msc',
+    'msi', 'msix', 'msixbundle', 'msp', 'mst', 'nsh', 'pif', 'ps1', 'scr', 'sct', 'shb',
+    'sys', 'vb', 'vbe', 'vbs', 'vhd', 'vxd', 'wsc', 'wsf', 'wsh', 'xll',
+  ],
+};
+
+/*
+ * Vercel refuses any request body over 4.5 MB before it reaches this code, and
+ * attachments arrive base64 encoded inside the JSON body, at 4/3 their size.
+ * 3 MB of files is 4 MB encoded, which leaves ~0.5 MB for the HTML and the rest
+ * of the payload. Anything larger would be a 413 from Vercel's edge with no
+ * explanation, so the limit is lowered here — and GET /api/mail/limits hands
+ * the lowered number to the compose form, which then warns before sending.
+ */
+const VERCEL_MAX_ATTACHMENTS_BYTES = 3 * MB;
+if (onVercel && attachments.maxTotalBytes > VERCEL_MAX_ATTACHMENTS_BYTES) {
+  if (process.env.MAX_ATTACHMENTS_TOTAL_MB) {
+    console.warn(
+      `MAX_ATTACHMENTS_TOTAL_MB=${process.env.MAX_ATTACHMENTS_TOTAL_MB} does not fit Vercel's ` +
+      '4.5 MB request limit once base64 encoded. Using 3.',
+    );
+  }
+  attachments.maxTotalBytes = VERCEL_MAX_ATTACHMENTS_BYTES;
+}
+
+if (attachments.maxFileBytes > attachments.maxTotalBytes) {
+  attachments.maxFileBytes = attachments.maxTotalBytes;
+}
+if (!Number.isInteger(attachments.maxCount) || attachments.maxCount < 1) {
+  throw new Error(`MAX_ATTACHMENT_COUNT must be a positive integer (got "${process.env.MAX_ATTACHMENT_COUNT}")`);
+}
+// Base64 costs 4 bytes per 3, so the encoded payload is what has to fit in 40 MB.
+if (Math.ceil(attachments.maxTotalBytes / 3) * 4 > RESEND_MAX_ENCODED_BYTES) {
+  throw new Error(
+    `MAX_ATTACHMENTS_TOTAL_MB is too large: ${(attachments.maxTotalBytes / MB).toFixed(1)} MB of files ` +
+    'exceeds 40 MB once base64 encoded, which Resend rejects. Use 30 or less.',
+  );
+}
+
+function parsePositiveInt(value, fallback, name) {
+  if (value === undefined || value === '') return fallback;
+  const number = Number(value);
+  if (!Number.isInteger(number) || number < 1) {
+    throw new Error(`${name} must be a positive integer (got "${value}")`);
+  }
+  return number;
+}
+
+function parsePositiveIntOrZero(value, fallback, name) {
+  if (value === '0') return 0;
+  return parsePositiveInt(value, fallback, name);
+}
+
+const quota = {
+  // Resend has no endpoint that reports remaining quota, so the plan's daily
+  // allowance is configured here. Confirmed to be a UTC calendar day, which is
+  // why every window in this app is UTC.
+  dailyLimit: parsePositiveInt(process.env.RESEND_DAILY_QUOTA, 100, 'RESEND_DAILY_QUOTA'),
+  /*
+   * Held back from scheduling, never bookable in advance.
+   *
+   * A date's allowance is shared by three things: mail scheduled for it, mail
+   * sent by hand on the day, and mail that arrives — received email counts
+   * against the quota too, one apiece. Letting schedules claim the whole hundred
+   * would mean a fully booked date silently rejects your inbox.
+   */
+  reserve: parsePositiveInt(process.env.RESEND_DAILY_RESERVE, 20, 'RESEND_DAILY_RESERVE'),
+};
+
+if (quota.reserve >= quota.dailyLimit) {
+  throw new Error(
+    `RESEND_DAILY_RESERVE (${quota.reserve}) must be below RESEND_DAILY_QUOTA ` +
+    `(${quota.dailyLimit}), or nothing could ever be scheduled.`,
+  );
+}
+
+/*
+ * How much of a date may be booked in advance.
+ *
+ * Derived from the quota rather than set beside it: the cap exists to keep a
+ * date's schedules inside what Resend will actually deliver that day, so two
+ * independent numbers would just be a way for them to disagree. An explicit
+ * MAX_SCHEDULED_PER_DAY may lower it but never raise it past the reserve.
+ */
+const schedulablePerDay = quota.dailyLimit - quota.reserve;
+const configuredPerDay = process.env.MAX_SCHEDULED_PER_DAY === undefined
+  || process.env.MAX_SCHEDULED_PER_DAY === ''
+  ? schedulablePerDay
+  : parsePositiveInt(process.env.MAX_SCHEDULED_PER_DAY, schedulablePerDay, 'MAX_SCHEDULED_PER_DAY');
+
+const scheduling = {
+  // Counted per DELIVERY day and per recipient: fifty mails scheduled for Monday
+  // spend fifty of Monday's slots, whichever day they were scheduled on. That is
+  // what makes it possible to lay out a week's mail over a weekend.
+  maxPerDay: Math.min(configuredPerDay, schedulablePerDay),
+  // Resend refuses a scheduled_at further out than this. Configurable because it
+  // is their number, not ours, and it has moved before (it was 72 hours once).
+  maxHorizonDays: parsePositiveInt(process.env.MAX_SCHEDULE_DAYS, 30, 'MAX_SCHEDULE_DAYS'),
+};
+
+if (configuredPerDay > schedulablePerDay) {
+  console.warn(
+    `MAX_SCHEDULED_PER_DAY (${configuredPerDay}) is above what the daily quota leaves ` +
+    `after the reserve (${schedulablePerDay}). Using ${schedulablePerDay}.`,
+  );
+}
+
+const bulk = {
+  // Resend's default rate limit is 2 requests/second per team. Sending is paced
+  // to stay under it rather than sprinting into a 429 and backing off.
+  sendsPerSecond: parsePositiveInt(process.env.RESEND_SENDS_PER_SECOND, 2, 'RESEND_SENDS_PER_SECOND'),
+  // A ceiling on one job, independent of the daily caps. Guards against a pasted
+  // spreadsheet of ten thousand rows becoming a job we then have to explain.
+  maxRecipients: parsePositiveInt(process.env.MAX_BULK_RECIPIENTS, 500, 'MAX_BULK_RECIPIENTS'),
+  // How long to wait out a 429 before re-offering the same recipient.
+  rateLimitBackoffMs: parsePositiveInt(
+    process.env.RATE_LIMIT_BACKOFF_MS, 5_000, 'RATE_LIMIT_BACKOFF_MS',
+  ),
+  /*
+   * How long one invocation may keep sending before it stops at a clean point
+   * and leaves the rest for the next run. 0 means no limit, which is right for a
+   * long-lived server. On Vercel the function is killed at its maxDuration,
+   * which vercel.json sets to 800 s (the Pro maximum), so the default stops 30 s
+   * short of that: 770 s at two a second is about 1,500 recipients per run.
+   * Keep the two in step — if maxDuration is lowered, lower this with it.
+   * Vercel's own deadline is also honoured where it is known (see runDeadline).
+   */
+  runBudgetMs: parsePositiveIntOrZero(
+    process.env.BULK_RUN_BUDGET_SECONDS, onVercel ? 770 : 0, 'BULK_RUN_BUDGET_SECONDS',
+  ) * 1000,
+};
+
+// The cap is now derived from the quota, so the two cannot disagree by
+// construction — the clamp above is what guarantees it.
+
+export const config = {
+  port: Number(process.env.PORT || 4000),
+  corsOrigins,
+  // Railway (and most PaaS) terminate TLS at a proxy, so trust its headers.
+  trustProxy: parseBoolean(process.env.TRUST_PROXY, isProduction),
+
+  resendApiKey: required('RESEND_API_KEY'),
+
+  // The address every outgoing mail is sent from. Accepts a bare address
+  // ("me@example.com") or one with a display name ("Me <me@example.com>").
+  mailboxAddress: required('MAILBOX_ADDRESS'),
+
+  auth: {
+    user: required('MAILBOX_USER'),
+    password: required('MAILBOX_PASSWORD'),
+    sessionSecret: required('SESSION_SECRET'),
+    // Renewed on activity (see refreshSessionIfStale), so this is the window of
+    // inactivity you are allowed, not a hard cap on staying signed in.
+    sessionMaxAgeMs: Number(process.env.SESSION_DAYS || 30) * 24 * 60 * 60 * 1000,
+    cookieName: 'mb_session',
+    cookieSameSite,
+    // Browsers reject SameSite=None unless the cookie is also Secure, so a
+    // cross-site deployment implies Secure whatever COOKIE_SECURE says.
+    cookieSecure:
+      cookieSameSite === 'none' ? true : parseBoolean(process.env.COOKIE_SECURE, isProduction),
+  },
+
+  attachments,
+  scheduling,
+  quota,
+  bulk,
+  // The JSON body has to hold every attachment base64 encoded plus the HTML body,
+  // so it is derived from the attachment budget rather than set independently —
+  // otherwise raising one silently leaves the other as the real limit.
+  jsonBodyLimitBytes: Math.ceil(attachments.maxTotalBytes / 3) * 4 + 2 * MB,
+
+  // Holds drafts and read/unread state — the two things Resend does not model.
+  mongoUri: required('MONGO_URI'),
+  mongoDbName: process.env.MONGO_DB || 'mailbox',
+
+  isProduction,
+  onVercel,
+
+  // Vercel sends `Authorization: Bearer <CRON_SECRET>` with every cron request.
+  // The cron routes refuse to run without it, so they cannot be called by anyone.
+  cronSecret: process.env.CRON_SECRET || null,
+};
